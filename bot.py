@@ -19,10 +19,26 @@ from db import (
     get_setting
 )
 
+# ================== HEALTH SERVER ==================
+from flask import Flask
+
+PORT = int(os.getenv("PORT", "8080"))
+
+health_app = Flask(__name__)
+
+@health_app.route("/")
+def home():
+    return "OK", 200
+
+@health_app.route("/health")
+def health():
+    return "OK", 200
+
+def run_health_server():
+    health_app.run(host="0.0.0.0", port=PORT)
 
 print("BOT.PY STARTED")
 
-    return "OK", 200
 
 def run_health_server():
     health_app.run(host="0.0.0.0", port=PORT)
