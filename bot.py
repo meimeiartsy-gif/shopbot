@@ -3,6 +3,8 @@ from datetime import datetime
 import threading
 
 from dotenv import load_dotenv
+from flask import Flask
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -14,45 +16,9 @@ from db import (
     init_db,
     ensure_user,
     get_balance,
-    add_balance,
     set_setting,
     get_setting
 )
-
-# ================== HEALTH SERVER ==================
-from flask import Flask
-
-PORT = int(os.getenv("PORT", "8080"))
-
-health_app = Flask(__name__)
-
-@health_app.route("/")
-def home():
-    return "OK", 200
-
-@health_app.route("/health")
-def health():
-    return "OK", 200
-
-def run_health_server():
-    health_app.run(host="0.0.0.0", port=PORT)
-
-print("BOT.PY STARTED")
-
-
-def run_health_server():
-    health_app.run(host="0.0.0.0", port=PORT)
-
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
-)
-
-from db import connect, init_db, ensure_user, get_balance, add_balance, set_setting, get_setting
-
-print("BOT.PY STARTED")
 
 # ================== ENV ==================
 load_dotenv()
@@ -65,15 +31,32 @@ if not BOT_TOKEN:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# ================== HELPERS ==================
+def money(n: int) -> str:
+    return f"₱{n:,}"
+
 def parse_product(name: str):
     if "|" in name:
         a, b = name.split("|", 1)
         return a.strip(), b.strip()
     return "All", name.strip()
 
-def money(n: int) -> str:
-    return f"₱{n:,}"
+print("BOT.PY STARTED")
+
+# ================== HEALTH SERVER (UptimeRobot) ==================
+PORT = int(os.getenv("PORT", "8080"))
+
+health_app = Flask(__name__)
+
+@health_app.get("/")
+def home():
+    return "OK", 200
+
+@health_app.get("/health")
+def health():
+    return "OK", 200
+
+def run_health_server():
+    health_app.run(host="0.0.0.0", port=PORT)
 
 # ================== POSTGRES HELPERS ==================
 def list_categories():
@@ -81,8 +64,7 @@ def list_categories():
         cur = db.cursor()
         cur.execute("SELECT name FROM products ORDER BY id ASC")
         rows = cur.fetchall()
-    cats = {parse_product(r[0])[0] for r in rows}
-    return sorted(cats)
+    return sorted({parse_product(r[0])[0] for r in rows})
 
 def list_products_in_category(category: str):
     with connect() as db:
@@ -114,41 +96,12 @@ def count_stock(variant_id: int) -> int:
         )
         return int(cur.fetchone()[0])
 
-def take_stock_items(variant_id: int, qty: int):
-    """
-    Atomically take qty available items and mark sold.
-    Returns list of payload strings.
-    """
+def set_variant_file(variant_id: int, file_id: str):
     with connect() as db:
         cur = db.cursor()
-
-        # lock rows (safe)
-        cur.execute("""
-            SELECT id, payload
-            FROM inventory_items
-            WHERE variant_id=%s AND status='available'
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT %s
-        """, (variant_id, qty))
-        rows = cur.fetchall()
-
-        if len(rows) != qty:
-            db.rollback()
-            return None
-
-        now = datetime.utcnow()
-        for iid, _payload in rows:
-            cur.execute("""
-                UPDATE inventory_items
-                SET status='sold', sold_to_user=%s, sold_at=%s
-                WHERE id=%s
-            """, (None, now, iid))
-
+        cur.execute("UPDATE variants SET telegram_file_id=%s WHERE id=%s", (file_id, variant_id))
         db.commit()
-        return [p for (_id, p) in rows]
 
-# ================== TOPUP HELPERS ==================
 def create_topup(user_id: int) -> int:
     with connect() as db:
         cur = db.cursor()
@@ -183,14 +136,11 @@ def approve_topup(topup_id: int, amount: int):
         if status != "PENDING":
             return None
 
-        # mark approved
         cur.execute("UPDATE topups SET status='APPROVED' WHERE id=%s", (topup_id,))
-        # credit balance
         cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
         db.commit()
         return int(user_id)
 
-# ================== ADMIN PRODUCT HELPERS ==================
 def add_product(name: str) -> int:
     with connect() as db:
         cur = db.cursor()
@@ -220,12 +170,6 @@ def add_stock_items(variant_id: int, items: list[str]) -> int:
             )
         db.commit()
     return len(items)
-
-def set_variant_file(variant_id: int, file_id: str):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("UPDATE variants SET telegram_file_id=%s WHERE id=%s", (file_id, variant_id))
-        db.commit()
 
 # ================== STARTUP ==================
 async def on_startup(app: Application):
@@ -264,7 +208,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-# ================== CALLBACKS ==================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -278,11 +221,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "topup":
         await topup_cmd(update, context)
-        return
-
-    if data == "home":
-        # easiest: tell user to /start again
-        await q.message.reply_text("Type /start to return home.")
         return
 
     if data.startswith("cat:"):
@@ -299,6 +237,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "home":
+        await q.message.reply_text("Type /start to return home.")
+        return
+
     if data.startswith("prod:"):
         pid = int(data.split(":")[1])
         variants = list_variants_for_product(pid)
@@ -307,7 +249,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for vid, vname, price, file_id in variants:
             stock_label = "∞" if file_id else str(count_stock(vid))
             buttons.append([InlineKeyboardButton(
-                f"{vname} — {money(price)} (Stock: {stock_label})",
+                f"{vname} — {money(int(price))} (Stock: {stock_label})",
                 callback_data=f"buy:{vid}"
             )])
 
@@ -342,8 +284,8 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with connect() as db:
         cur = db.cursor()
         cur.execute("""
-            SELECT v.price, p.name, v.name, v.telegram_file_id
-            FROM variants v JOIN products p ON p.id=v.product_id
+            SELECT v.price, v.name, v.telegram_file_id
+            FROM variants v
             WHERE v.id=%s
         """, (variant_id,))
         row = cur.fetchone()
@@ -352,7 +294,7 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Package not found.")
         return
 
-    price, product_full, vname, file_id = row
+    price, vname, file_id = row
     total = int(price) * qty
     bal = get_balance(user_id)
 
@@ -365,7 +307,6 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Need {money(total)}, you have {money(bal)}.")
             return
 
-        # deduct balance
         with connect() as db:
             cur = db.cursor()
             cur.execute(
@@ -393,10 +334,10 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not enough stock.")
         return
 
-    # Deduct + deliver stock
     with connect() as db:
         cur = db.cursor()
         cur.execute("BEGIN;")
+
         cur.execute(
             "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance>=%s",
             (total, user_id, total)
@@ -614,10 +555,10 @@ async def setfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
-    threading.Thread(target=run_health_server, daemon=True).start(
-    # handlers...
-    app.run_polling()
+    # start health server for domain ping
+    threading.Thread(target=run_health_server, daemon=True).start()
 
+    # handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("topup", topup_cmd))
     app.add_handler(CommandHandler("paid", paid_cmd))
