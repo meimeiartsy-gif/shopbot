@@ -1,9 +1,6 @@
 import os
 from datetime import datetime
-import threading
-
 from dotenv import load_dotenv
-from flask import Flask
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,28 +8,17 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
-from db import (
-    connect,
-    init_db,
-    ensure_user,
-    get_balance,
-    set_setting,
-    get_setting
-)
+from db import connect, init_db, ensure_user, get_balance, set_setting, get_setting
 
-# ================== ENV ==================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing in Railway Variables")
+    raise SystemExit("BOT_TOKEN missing in Railway Variables")
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
-def money(n: int) -> str:
-    return f"₱{n:,}"
 
 def parse_product(name: str):
     if "|" in name:
@@ -40,25 +26,10 @@ def parse_product(name: str):
         return a.strip(), b.strip()
     return "All", name.strip()
 
-print("BOT.PY STARTED")
+def money(n: int) -> str:
+    return f"₱{n:,}"
 
-# ================== HEALTH SERVER (UptimeRobot) ==================
-PORT = int(os.getenv("PORT", "8080"))
-
-health_app = Flask(__name__)
-
-@health_app.get("/")
-def home():
-    return "OK", 200
-
-@health_app.get("/health")
-def health():
-    return "OK", 200
-
-def run_health_server():
-    health_app.run(host="0.0.0.0", port=PORT)
-
-# ================== POSTGRES HELPERS ==================
+# ---------------- DB helpers (shop) ----------------
 def list_categories():
     with connect() as db:
         cur = db.cursor()
@@ -90,10 +61,7 @@ def list_variants_for_product(product_id: int):
 def count_stock(variant_id: int) -> int:
     with connect() as db:
         cur = db.cursor()
-        cur.execute(
-            "SELECT COUNT(*) FROM inventory_items WHERE variant_id=%s AND status='available'",
-            (variant_id,)
-        )
+        cur.execute("SELECT COUNT(*) FROM inventory_items WHERE variant_id=%s AND status='available'", (variant_id,))
         return int(cur.fetchone()[0])
 
 def set_variant_file(variant_id: int, file_id: str):
@@ -119,10 +87,7 @@ def get_topup(topup_id: int):
 def attach_topup_proof(topup_id: int, proof_file_id: str):
     with connect() as db:
         cur = db.cursor()
-        cur.execute(
-            "UPDATE topups SET proof_file_id=%s WHERE id=%s",
-            (proof_file_id, topup_id)
-        )
+        cur.execute("UPDATE topups SET proof_file_id=%s WHERE id=%s", (proof_file_id, topup_id))
         db.commit()
 
 def approve_topup(topup_id: int, amount: int):
@@ -135,49 +100,18 @@ def approve_topup(topup_id: int, amount: int):
         user_id, status = row
         if status != "PENDING":
             return None
-
         cur.execute("UPDATE topups SET status='APPROVED' WHERE id=%s", (topup_id,))
         cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
         db.commit()
         return int(user_id)
 
-def add_product(name: str) -> int:
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("INSERT INTO products(name) VALUES(%s) RETURNING id", (name,))
-        pid = cur.fetchone()[0]
-        db.commit()
-        return int(pid)
-
-def add_variant(product_id: int, price: int, name: str) -> int:
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute(
-            "INSERT INTO variants(product_id,name,price) VALUES(%s,%s,%s) RETURNING id",
-            (product_id, name, price)
-        )
-        vid = cur.fetchone()[0]
-        db.commit()
-        return int(vid)
-
-def add_stock_items(variant_id: int, items: list[str]) -> int:
-    with connect() as db:
-        cur = db.cursor()
-        for it in items:
-            cur.execute(
-                "INSERT INTO inventory_items(variant_id,payload,status) VALUES(%s,%s,'available')",
-                (variant_id, it)
-            )
-        db.commit()
-    return len(items)
-
-# ================== STARTUP ==================
+# ---------------- Startup ----------------
 async def on_startup(app: Application):
     print("Initializing DB...")
     init_db()
-    print("DB ready.")
+    print("DB ready. Starting bot...")
 
-# ================== UI ==================
+# ---------------- UI ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     ensure_user(user_id)
@@ -215,8 +149,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if data == "balance":
-        bal = get_balance(user_id)
-        await q.message.reply_text(f"💳 Balance: {money(bal)}")
+        await q.message.reply_text(f"💳 Balance: {money(get_balance(user_id))}")
         return
 
     if data == "topup":
@@ -249,7 +182,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for vid, vname, price, file_id in variants:
             stock_label = "∞" if file_id else str(count_stock(vid))
             buttons.append([InlineKeyboardButton(
-                f"{vname} — {money(int(price))} (Stock: {stock_label})",
+                f"{vname} — {money(price)} (Stock: {stock_label})",
                 callback_data=f"buy:{vid}"
             )])
 
@@ -262,7 +195,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Enter quantity (1–50):")
         return
 
-# ================== BUY ==================
+# ---------------- BUY + AUTO DELIVERY ----------------
 async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "variant" not in context.user_data:
         return
@@ -284,8 +217,8 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with connect() as db:
         cur = db.cursor()
         cur.execute("""
-            SELECT v.price, v.name, v.telegram_file_id
-            FROM variants v
+            SELECT v.price, p.name, v.name, v.telegram_file_id
+            FROM variants v JOIN products p ON p.id=v.product_id
             WHERE v.id=%s
         """, (variant_id,))
         row = cur.fetchone()
@@ -294,14 +227,14 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Package not found.")
         return
 
-    price, vname, file_id = row
+    price, product_full, vname, file_id = row
     total = int(price) * qty
     bal = get_balance(user_id)
 
     # FILE PRODUCT
     if file_id:
         if qty != 1:
-            await update.message.reply_text("❌ File products quantity must be 1.")
+            await update.message.reply_text("❌ File product quantity must be 1.")
             return
         if bal < total:
             await update.message.reply_text(f"❌ Need {money(total)}, you have {money(bal)}.")
@@ -362,7 +295,7 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         now = datetime.utcnow()
-        for iid, _payload in items:
+        for iid, payload in items:
             cur.execute("""
                 UPDATE inventory_items
                 SET status='sold', sold_to_user=%s, sold_at=%s
@@ -374,7 +307,7 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payloads = "\n".join(p for (_id, p) in items)
     await update.message.reply_text(f"✅ Purchase Successful\n📦 {vname}\n\n{payloads}")
 
-# ================== TOPUP ==================
+# ---------------- TOPUP + QR ----------------
 async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     ensure_user(user_id)
@@ -384,8 +317,8 @@ async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pay_text = get_setting("PAYMENT_TEXT") or (
         "📌 Payment Instructions:\n"
         "1) Pay using the QR (GCash/GoTyme)\n"
-        "2) After paying, message admin and send proof\n"
-        "3) Then send the screenshot here with:\n"
+        "2) Message admin and send proof\n"
+        "3) Then send screenshot here with:\n"
     )
 
     text = (
@@ -400,7 +333,7 @@ async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if qr_file_id:
         await chat.reply_photo(photo=qr_file_id, caption=text)
     else:
-        await chat.reply_text(text + "\n\n⚠️ Admin has not set QR yet. Admin use /setqr first.")
+        await chat.reply_text(text + "\n\n⚠️ Admin has not set QR yet. Admin use /setqr")
 
 async def paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -460,83 +393,37 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Approved topup #{topup_id}, credited {money(amount)}.")
     await context.bot.send_message(chat_id=credited_user_id, text=f"✅ Topup approved. +{money(amount)}")
 
-# ================== ADMIN: QR SETUP ==================
+# Admin: set QR (send photo with /setqr first, then send image)
 async def setqr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     context.user_data["awaiting_qr"] = True
-    await update.message.reply_text("✅ Send your QR image now (as PHOTO).")
+    await update.message.reply_text("✅ Now send your QR image (as PHOTO).")
 
 async def capture_qr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     if not context.user_data.get("awaiting_qr"):
         return
-
-    file_id = None
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-    elif update.message.document:
-        file_id = update.message.document.file_id
-
-    if not file_id:
-        await update.message.reply_text("❌ Please send the QR as a PHOTO (or document).")
+    if not update.message.photo:
+        await update.message.reply_text("❌ Send as PHOTO (not text).")
         return
-
+    file_id = update.message.photo[-1].file_id
     set_setting("PAYMENT_QR_FILE_ID", file_id)
     context.user_data["awaiting_qr"] = False
-    await update.message.reply_text("✅ QR saved! Now /topup will show it.")
+    await update.message.reply_text("✅ QR saved! /topup will show it now.")
 
 async def setpaytext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     text = update.message.text.replace("/setpaytext", "", 1).strip()
     if not text:
-        await update.message.reply_text("Usage:\n/setpaytext <your payment instructions text>")
+        await update.message.reply_text("Usage:\n/setpaytext <your instructions>")
         return
-
     set_setting("PAYMENT_TEXT", text)
     await update.message.reply_text("✅ Payment instructions saved!")
 
-# ================== ADMIN: PRODUCTS ==================
-async def addproduct_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    name = " ".join(context.args).strip()
-    if not name:
-        await update.message.reply_text("Usage: /addproduct <Category | Product Name>")
-        return
-    pid = add_product(name)
-    await update.message.reply_text(f"✅ Product added. ID: {pid}")
-
-async def addvariant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if len(context.args) < 3:
-        await update.message.reply_text("Usage: /addvariant <product_id> <price> <variant name...>")
-        return
-    product_id = int(context.args[0])
-    price = int(context.args[1])
-    name = " ".join(context.args[2:]).strip()
-    vid = add_variant(product_id, price, name)
-    await update.message.reply_text(f"✅ Variant added. ID: {vid}")
-
-async def addstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage:\n/addstock <variant_id>\n<one item per line>")
-        return
-    variant_id = int(context.args[0])
-    lines = update.message.text.splitlines()
-    if len(lines) < 2:
-        await update.message.reply_text("Put items on the next lines (one per line).")
-        return
-    items = [ln.strip() for ln in lines[1:] if ln.strip()]
-    n = add_stock_items(variant_id, items)
-    await update.message.reply_text(f"✅ Added {n} stock items.")
-
+# Admin: set file delivery for a variant
 async def setfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -551,29 +438,23 @@ async def setfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_variant_file(variant_id, file_id)
     await update.message.reply_text("✅ File auto-delivery set.")
 
-# ================== MAIN ==================
+# ---------------- MAIN ----------------
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
-    # start health server for domain ping
-    threading.Thread(target=run_health_server, daemon=True).start()
-
-    # handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_callback))
+
     app.add_handler(CommandHandler("topup", topup_cmd))
     app.add_handler(CommandHandler("paid", paid_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
 
     app.add_handler(CommandHandler("setqr", setqr_cmd))
+    app.add_handler(MessageHandler(filters.PHOTO, capture_qr_photo))
     app.add_handler(CommandHandler("setpaytext", setpaytext_cmd))
 
-    app.add_handler(CommandHandler("addproduct", addproduct_cmd))
-    app.add_handler(CommandHandler("addvariant", addvariant_cmd))
-    app.add_handler(CommandHandler("addstock", addstock_cmd))
     app.add_handler(CommandHandler("setfile", setfile_cmd))
 
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, capture_qr_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, buy_qty_message))
 
     print("Starting bot...")
