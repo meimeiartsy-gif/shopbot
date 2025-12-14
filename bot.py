@@ -597,10 +597,11 @@ async def setfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== MAIN ==================
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
-threading.Thread(target=run_health_server, daemon=True).start()
 
+    threading.Thread(target=run_health_server, daemon=True).start(
     # handlers...
     app.run_polling()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("topup", topup_cmd))
     app.add_handler(CommandHandler("paid", paid_cmd))
