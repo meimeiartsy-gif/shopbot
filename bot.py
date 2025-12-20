@@ -162,7 +162,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             guide = get_setting(PAY_GCASH_TEXT_KEY) or (
                 "💸 GCASH PAYMENT GUIDE\n\n"
                 "1) Scan the QR\n"
-                "2) Pay exact amount\n"
+                "2) Pay exact amount, no refund policy\n"
                 "3) Send screenshot proof here\n\n"
                 f"Then send:\n/paid {topup_id}\n\n"
                 f"Admin: {ADMIN_USERNAME}"
