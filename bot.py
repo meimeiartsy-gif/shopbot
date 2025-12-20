@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 # =========================
-# LOGGING (IMPORTANT: prevents "no respond")
+# LOGGING
 # =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopbot")
@@ -108,29 +108,25 @@ async def adb_fetchall(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(db_fetchall, sql, params)
 
 # =========================
-# Safe message editing (fixes "click no respond")
+# Safe edit fallback (fixes "button click -> error")
 # =========================
 async def safe_edit_or_send(q, text: str, reply_markup=None, parse_mode=None):
-    """
-    Try edit_message_text, if fails then send a new message.
-    This fixes "buttons not responding" caused by edit errors.
-    """
     try:
         await q.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception as e:
-        logger.warning("Edit failed, fallback to send. %s", e)
+        logger.warning("Edit failed fallback send: %s", e)
         await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 # =========================
-# Defaults / Settings
+# SETTINGS / TEXTS
 # =========================
 DEFAULT_TEXTS = {
     "welcome_text": "🌙 *Luna’s Prem Shop*\n\nChoose an option below:",
     "help_text": f"Need help? Tap *Chat Admin* or DM {ADMIN_USERNAME}",
 
     "topup_menu_text": "💳 *Add Balance*\nChoose payment method:",
-    "gcash_text": "💳 *GCash Payment*\nScan QR and pay exact amount.\n\nAfter paying, choose amount then send screenshot proof.",
-    "gotyme_text": "🏦 *GoTyme Payment*\nScan QR and pay exact amount.\n\nAfter paying, choose amount then send screenshot proof.",
+    "gcash_text": "💳 *GCash Payment*\nScan QR and pay exact amount.\n\nThen choose amount and send screenshot proof.",
+    "gotyme_text": "🏦 *GoTyme Payment*\nScan QR and pay exact amount.\n\nThen choose amount and send screenshot proof.",
 
     "topup_send_proof_text": f"📸 Now send your *payment screenshot* (Photo or Document).\n\nFor fast approval, DM admin: {ADMIN_USERNAME}",
     "topup_received_text": f"✅ Thank you! Proof received.\n🧾 TopUp ID: `{{topup_id}}`\n⏳ Waiting for admin approval.\n\nFor fast approval, DM admin: {ADMIN_USERNAME}",
@@ -139,7 +135,7 @@ DEFAULT_TEXTS = {
 
     "insufficient_balance_text": "❌ Not enough balance. Please top up first.",
     "purchase_success_text": "✅ Purchase complete!\nTransaction ID: `{transaction_id}`\n💰 Remaining Balance: *₱{balance}*",
-    "delivery_not_set_text": f"⚠️ Delivery is not set yet for this product. Please DM admin: {ADMIN_USERNAME}",
+    "delivery_not_set_text": f"⚠️ Delivery is not set yet for this product.\nPlease DM admin: {ADMIN_USERNAME}",
 }
 
 SCHEMA_CREATE_SQL = """
@@ -148,7 +144,6 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT,
   first_name TEXT,
   balance INTEGER NOT NULL DEFAULT 0,
-  is_banned BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -195,12 +190,15 @@ CREATE TABLE IF NOT EXISTS settings (
 
 async def init_db():
     await adb_exec(SCHEMA_CREATE_SQL)
+
+    # default texts
     for k, v in DEFAULT_TEXTS.items():
         await adb_exec(
             "INSERT INTO settings(key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
             (k, v),
         )
 
+    # QR keys
     for k in ["GCASH_QR_FILE_ID", "GOTYME_QR_FILE_ID"]:
         await adb_exec(
             "INSERT INTO settings(key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
@@ -225,7 +223,7 @@ async def get_text(key: str) -> str:
     return DEFAULT_TEXTS.get(key, "")
 
 # =========================
-# Utils
+# Utilities
 # =========================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -295,14 +293,14 @@ def amount_kb(method: str):
     return InlineKeyboardMarkup(rows)
 
 # =========================
-# STARTUP
+# Startup
 # =========================
 async def on_startup(app: Application):
     await init_db()
-    logger.info("DB ready")
+    logger.info("DB ready.")
 
 # =========================
-# BASIC
+# Commands / Screens
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await upsert_user(update.effective_user)
@@ -379,7 +377,6 @@ async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def shop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     data = q.data
 
     if data.startswith("cat:"):
@@ -439,7 +436,7 @@ async def shop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "buy_cancel":
-        await safe_edit_or_send(q, "✅ Cancelled. No payment deducted.")
+        await q.message.reply_text("✅ Cancelled. No payment deducted.")
         return
 
     if data.startswith("buy_confirm:"):
@@ -499,7 +496,6 @@ async def topup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def topup_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     data = q.data
 
     if data == "topup_menu":
@@ -507,7 +503,7 @@ async def topup_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "topup_back":
-        await safe_edit_or_send(q, "Back.")
+        await q.message.reply_text("Back.")
         return
 
     if data.startswith("topup_method:"):
@@ -628,8 +624,6 @@ async def proof_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def topup_admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-
     if not is_admin(q.from_user.id):
         await q.message.reply_text("❌ You are not admin.")
         return
@@ -712,13 +706,11 @@ def product_manage_kb(pid: int, active: bool):
 
 async def admin_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    data = q.data
 
     if not is_admin(q.from_user.id):
         await q.message.reply_text("❌ You are not admin.")
         return
-
-    data = q.data
 
     if data == "admin_close":
         await safe_edit_or_send(q, "Closed.")
@@ -747,13 +739,21 @@ async def admin_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT topup_id, user_id, amount, method FROM topups WHERE status='pending' ORDER BY id DESC LIMIT 30"
         )
         if not rows:
-            await safe_edit_or_send(q, "✅ No pending topups.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]))
+            await safe_edit_or_send(
+                q,
+                "✅ No pending topups.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]),
+            )
             return
         msg = ["💳 *Pending Topups (last 30)*"]
         for r in rows:
             msg.append(f"• `{r['topup_id']}` | +₱{r['amount']} | {str(r['method']).upper()} | user `{r['user_id']}`")
-        await safe_edit_or_send(q, "\n".join(msg), parse_mode=ParseMode.MARKDOWN,
-                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]))
+        await safe_edit_or_send(
+            q,
+            "\n".join(msg),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]),
+        )
         return
 
     if data == "admin_purchases":
@@ -772,13 +772,19 @@ async def admin_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for r in rows:
                 pname = r["product_name"] or "deleted-product"
                 msg.append(f"• `{r['transaction_id']}` | {pname} | -₱{r['price']} | user `{r['user_id']}`")
-        await safe_edit_or_send(q, "\n".join(msg), parse_mode=ParseMode.MARKDOWN,
-                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]))
+        await safe_edit_or_send(
+            q,
+            "\n".join(msg),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]),
+        )
         return
 
     if data == "prod_add":
-        await adb_exec("INSERT INTO products(category, name, description, price, is_active) VALUES (%s,%s,%s,%s,TRUE)",
-                       ("General", "New Product", "", 0))
+        await adb_exec(
+            "INSERT INTO products(category, name, description, price, is_active) VALUES (%s,%s,%s,%s,TRUE)",
+            ("General", "New Product", "", 0),
+        )
         products = await adb_fetchall("SELECT id, category, name, price, is_active FROM products ORDER BY id DESC")
         await safe_edit_or_send(q, "✅ Product created. Select it to edit:", parse_mode=ParseMode.MARKDOWN, reply_markup=products_list_kb(products))
         return
@@ -952,7 +958,43 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use the menu buttons.", reply_markup=main_menu_kb(update.effective_user.id))
 
 # =========================
-# ERROR handler (prevents freeze)
+# SINGLE CALLBACK ROUTER (IMPORTANT FIX)
+# =========================
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+        data = q.data or ""
+        logger.info("Callback: %s", data)
+
+        # SHOP
+        if data.startswith(("cat:", "prod:", "buy_confirm:")) or data in ("cats_back", "buy_cancel"):
+            await shop_cb(update, context)
+            return
+
+        # TOPUP
+        if data.startswith(("topup_", "topup_method:", "topup_amount:")):
+            await topup_cb(update, context)
+            return
+
+        # ADMIN approve/reject
+        if data.startswith(("tu_approve:", "tu_reject:")):
+            await topup_admin_cb(update, context)
+            return
+
+        # ADMIN panel
+        if data.startswith(("admin_", "prod_", "pay_setqr:")):
+            await admin_menu_cb(update, context)
+            return
+
+        await q.message.reply_text("Unknown button. Type /start again.")
+
+    except Exception as e:
+        logger.exception("Callback crashed: %s", e)
+        await q.message.reply_text("⚠️ Bot error happened. Try again in a moment.")
+
+# =========================
+# ERROR handler
 # =========================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error: %s", context.error)
@@ -973,11 +1015,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
-    # callbacks
-    app.add_handler(CallbackQueryHandler(shop_cb, pattern=r"^(cat:|cats_back$|prod:|buy_confirm:|buy_cancel$)"))
-    app.add_handler(CallbackQueryHandler(topup_cb, pattern=r"^(topup_menu$|topup_back$|topup_method:|topup_amount:)"))
-    app.add_handler(CallbackQueryHandler(topup_admin_cb, pattern=r"^(tu_approve:|tu_reject:)"))
-    app.add_handler(CallbackQueryHandler(admin_menu_cb, pattern=r"^(admin_|prod_|pay_setqr:)"))
+    # ✅ ONE callback handler only
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     # admin edits (text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_product_message), group=0)
