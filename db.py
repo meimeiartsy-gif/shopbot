@@ -5,7 +5,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 def connect():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing. Add PostgreSQL in Railway and redeploy.")
+        raise RuntimeError("DATABASE_URL is missing. Add it in Railway Variables.")
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
@@ -15,7 +15,7 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            balance INTEGER NOT NULL DEFAULT 0
+            balance INTEGER DEFAULT 0
         );
         """)
 
@@ -80,6 +80,26 @@ def get_balance(user_id: int) -> int:
         cur.execute("SELECT balance FROM users WHERE user_id=%s", (user_id,))
         row = cur.fetchone()
         return int(row[0]) if row else 0
+
+def add_balance(user_id: int, amount: int):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
+        db.commit()
+
+def deduct_balance_if_enough(user_id: int, amount: int) -> bool:
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE users SET balance = balance - %s WHERE user_id=%s AND balance >= %s",
+            (amount, user_id, amount)
+        )
+        ok = (cur.rowcount == 1)
+        if ok:
+            db.commit()
+        else:
+            db.rollback()
+        return ok
 
 def set_setting(key: str, value: str):
     with connect() as db:

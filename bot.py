@@ -1,285 +1,121 @@
 import os
+import io
+import zipfile
 from datetime import datetime
-from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from dotenv import load_dotenv
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-from db import connect, init_db, ensure_user, get_balance, set_setting, get_setting
+from db import (
+    connect,
+    init_db,
+    ensure_user,
+    get_balance,
+    add_balance,
+    deduct_balance_if_enough,
+)
 
+# ================== VERSION (DEBUG) ==================
+BOT_VERSION = "v1-buttons-2025-12-20"
+
+# ================== CONFIG ==================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
+# Your admin username (for "Chat Admin" button)
+ADMIN_USERNAME = "@lovebylunaa"
+
 if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN missing in Railway Variables")
+    raise SystemExit("❌ BOT_TOKEN missing in Railway Variables")
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+def money(n: int) -> str:
+    return f"₱{int(n):,}"
+
 def parse_product(name: str):
+    # "Category | Product Name"
     if "|" in name:
         a, b = name.split("|", 1)
         return a.strip(), b.strip()
     return "All", name.strip()
 
-def money(n: int) -> str:
-    return f"₱{n:,}"
+# ================== KEYBOARDS ==================
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton("📦 List Produk"), KeyboardButton("💰 Balance")],
+        [KeyboardButton("💬 Chat Admin")],
+    ],
+    resize_keyboard=True
+)
 
-# ---------------- DB helpers (shop) ----------------
-def list_categories():
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("SELECT name FROM products ORDER BY id ASC")
-        rows = cur.fetchall()
-    return sorted({parse_product(r[0])[0] for r in rows})
+CANCEL_MENU = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton("❌ Cancel Order")]],
+    resize_keyboard=True
+)
 
-def list_products_in_category(category: str):
+# ================== DB QUERY HELPERS ==================
+def list_products():
     with connect() as db:
         cur = db.cursor()
         cur.execute("SELECT id, name FROM products ORDER BY id ASC")
-        rows = cur.fetchall()
-    out = []
-    for pid, pname in rows:
-        cat, title = parse_product(pname)
-        if cat == category:
-            out.append((pid, title))
-    return out
+        return cur.fetchall()
 
-def list_variants_for_product(product_id: int):
+def list_variants(product_id: int):
     with connect() as db:
         cur = db.cursor()
-        cur.execute(
-            "SELECT id, name, price, telegram_file_id FROM variants WHERE product_id=%s ORDER BY id ASC",
-            (product_id,)
-        )
+        cur.execute("""
+            SELECT id, name, price, telegram_file_id
+            FROM variants
+            WHERE product_id=%s
+            ORDER BY id ASC
+        """, (product_id,))
         return cur.fetchall()
+
+def get_variant(variant_id: int):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("""
+            SELECT v.id, v.name, v.price, v.telegram_file_id, p.name
+            FROM variants v
+            JOIN products p ON p.id=v.product_id
+            WHERE v.id=%s
+        """, (variant_id,))
+        return cur.fetchone()
 
 def count_stock(variant_id: int) -> int:
     with connect() as db:
         cur = db.cursor()
-        cur.execute("SELECT COUNT(*) FROM inventory_items WHERE variant_id=%s AND status='available'", (variant_id,))
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM inventory_items
+            WHERE variant_id=%s AND status='available'
+        """, (variant_id,))
         return int(cur.fetchone()[0])
 
-def set_variant_file(variant_id: int, file_id: str):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("UPDATE variants SET telegram_file_id=%s WHERE id=%s", (file_id, variant_id))
-        db.commit()
-
-def create_topup(user_id: int) -> int:
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("INSERT INTO topups(user_id,status) VALUES(%s,'PENDING') RETURNING id", (user_id,))
-        topup_id = cur.fetchone()[0]
-        db.commit()
-        return int(topup_id)
-
-def get_topup(topup_id: int):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("SELECT id, user_id, status, proof_file_id FROM topups WHERE id=%s", (topup_id,))
-        return cur.fetchone()
-
-def attach_topup_proof(topup_id: int, proof_file_id: str):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("UPDATE topups SET proof_file_id=%s WHERE id=%s", (proof_file_id, topup_id))
-        db.commit()
-
-def approve_topup(topup_id: int, amount: int):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("SELECT user_id, status FROM topups WHERE id=%s", (topup_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        user_id, status = row
-        if status != "PENDING":
-            return None
-        cur.execute("UPDATE topups SET status='APPROVED' WHERE id=%s", (topup_id,))
-        cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
-        db.commit()
-        return int(user_id)
-
-# ---------------- Startup ----------------
-async def on_startup(app: Application):
-    print("Initializing DB...")
-    init_db()
-    print("DB ready. Starting bot...")
-
-# ---------------- UI ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-    bal = get_balance(user_id)
-    cats = list_categories()
-
-    text = (
-        "🌙 Luna’s Prem Shop\n"
-        "━━━━━━━━━━━━━━\n"
-        f"💳 Balance: {money(bal)}\n"
-        "🛍 Choose a category:"
-    )
-
-    buttons = []
-    row = []
-    for c in cats:
-        row.append(InlineKeyboardButton(f"✨ {c}", callback_data=f"cat:{c}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([
-        InlineKeyboardButton("➕ Top Up", callback_data="topup"),
-        InlineKeyboardButton("💰 Balance", callback_data="balance")
-    ])
-
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    user_id = update.effective_user.id
-
-    if data == "balance":
-        await q.message.reply_text(f"💳 Balance: {money(get_balance(user_id))}")
-        return
-
-    if data == "topup":
-        await topup_cmd(update, context)
-        return
-
-    if data.startswith("cat:"):
-        cat = data.split(":", 1)[1]
-        products = list_products_in_category(cat)
-
-        buttons = [[InlineKeyboardButton(f"• {title}", callback_data=f"prod:{pid}")]
-                   for pid, title in products]
-        buttons.append([InlineKeyboardButton("⬅ Back", callback_data="home")])
-
-        await q.edit_message_text(
-            f"✨ {cat}\n━━━━━━━━━━━━━━\nSelect product:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
-
-    if data == "home":
-        await q.message.reply_text("Type /start to return home.")
-        return
-
-    if data.startswith("prod:"):
-        pid = int(data.split(":")[1])
-        variants = list_variants_for_product(pid)
-
-        buttons = []
-        for vid, vname, price, file_id in variants:
-            stock_label = "∞" if file_id else str(count_stock(vid))
-            buttons.append([InlineKeyboardButton(
-                f"{vname} — {money(price)} (Stock: {stock_label})",
-                callback_data=f"buy:{vid}"
-            )])
-
-        buttons.append([InlineKeyboardButton("⬅ Back", callback_data="home")])
-        await q.edit_message_text("Choose package:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data.startswith("buy:"):
-        context.user_data["variant"] = int(data.split(":")[1])
-        await q.message.reply_text("Enter quantity (1–50):")
-        return
-
-# ---------------- BUY + AUTO DELIVERY ----------------
-async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "variant" not in context.user_data:
-        return
-
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-
-    try:
-        qty = int(update.message.text.strip())
-        if qty < 1 or qty > 50:
-            await update.message.reply_text("Qty must be 1–50.")
-            return
-    except:
-        await update.message.reply_text("Please enter a number.")
-        return
-
-    variant_id = int(context.user_data.pop("variant"))
-
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("""
-            SELECT v.price, p.name, v.name, v.telegram_file_id
-            FROM variants v JOIN products p ON p.id=v.product_id
-            WHERE v.id=%s
-        """, (variant_id,))
-        row = cur.fetchone()
-
-    if not row:
-        await update.message.reply_text("Package not found.")
-        return
-
-    price, product_full, vname, file_id = row
-    total = int(price) * qty
-    bal = get_balance(user_id)
-
-    # FILE PRODUCT
-    if file_id:
-        if qty != 1:
-            await update.message.reply_text("❌ File product quantity must be 1.")
-            return
-        if bal < total:
-            await update.message.reply_text(f"❌ Need {money(total)}, you have {money(bal)}.")
-            return
-
-        with connect() as db:
-            cur = db.cursor()
-            cur.execute(
-                "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance>=%s",
-                (total, user_id, total)
-            )
-            if cur.rowcount != 1:
-                db.rollback()
-                await update.message.reply_text("❌ Insufficient balance.")
-                return
-            db.commit()
-
-        await update.message.reply_document(
-            document=file_id,
-            caption=f"✅ Purchase Successful\n📦 {vname}\nTotal: {money(total)}"
-        )
-        return
-
-    # STOCK PRODUCT
-    if bal < total:
-        await update.message.reply_text(f"❌ Need {money(total)}, you have {money(bal)}.")
-        return
-
-    if count_stock(variant_id) < qty:
-        await update.message.reply_text("❌ Not enough stock.")
-        return
-
+def take_stock_payloads(variant_id: int, qty: int, user_id: int):
+    """
+    Take qty stock items atomically and mark sold.
+    """
     with connect() as db:
         cur = db.cursor()
         cur.execute("BEGIN;")
-
-        cur.execute(
-            "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance>=%s",
-            (total, user_id, total)
-        )
-        if cur.rowcount != 1:
-            db.rollback()
-            await update.message.reply_text("❌ Insufficient balance.")
-            return
-
         cur.execute("""
             SELECT id, payload
             FROM inventory_items
@@ -288,14 +124,13 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             FOR UPDATE SKIP LOCKED
             LIMIT %s
         """, (variant_id, qty))
-        items = cur.fetchall()
-        if len(items) != qty:
+        rows = cur.fetchall()
+        if len(rows) != qty:
             db.rollback()
-            await update.message.reply_text("❌ Stock changed. Try again.")
-            return
+            return None
 
         now = datetime.utcnow()
-        for iid, payload in items:
+        for iid, _payload in rows:
             cur.execute("""
                 UPDATE inventory_items
                 SET status='sold', sold_to_user=%s, sold_at=%s
@@ -303,162 +138,384 @@ async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, (user_id, now, iid))
 
         db.commit()
+        return [p for (_id, p) in rows]
 
-    payloads = "\n".join(p for (_id, p) in items)
-    await update.message.reply_text(f"✅ Purchase Successful\n📦 {vname}\n\n{payloads}")
+def set_variant_file(variant_id: int, file_id: str):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("UPDATE variants SET telegram_file_id=%s WHERE id=%s", (file_id, variant_id))
+        db.commit()
+# ================== STARTUP ==================
+async def on_startup(app: Application):
+    print("Initializing DB...")
+    init_db()
+    print("DB ready.")
 
-# ---------------- TOPUP + QR ----------------
-async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== COMMANDS ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ensure_user(user_id)
+    bal = get_balance(user_id)
+
+    await update.message.reply_text(
+        f"🌙 Luna’s Prem Shop\n\n💳 Balance: {money(bal)}\n\nChoose an option:",
+        reply_markup=MAIN_MENU
+    )
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ensure_user(user_id)
+    bal = get_balance(user_id)
+    await update.message.reply_text(
+        f"📌 Menu\n💳 Balance: {money(bal)}",
+        reply_markup=MAIN_MENU
+    )
+
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"✅ Running: {BOT_VERSION}", reply_markup=MAIN_MENU)
+
+# ================== MENU HANDLER ==================
+async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
     user_id = update.effective_user.id
     ensure_user(user_id)
 
-    topup_id = create_topup(user_id)
-    qr_file_id = get_setting("PAYMENT_QR_FILE_ID")
-    pay_text = get_setting("PAYMENT_TEXT") or (
-        "📌 Payment Instructions:\n"
-        "1) Pay using the QR (GCash/GoTyme)\n"
-        "2) Message admin and send proof\n"
-        "3) Then send screenshot here with:\n"
-    )
-
-    text = (
-        "🧾 TOP UP (Manual)\n"
-        "━━━━━━━━━━━━━━\n"
-        f"{pay_text}\n\n"
-        f"✅ Send your screenshot with caption:\n/paid {topup_id}\n\n"
-        "⏳ Waiting for admin confirmation."
-    )
-
-    chat = update.callback_query.message if update.callback_query else update.message
-    if qr_file_id:
-        await chat.reply_photo(photo=qr_file_id, caption=text)
-    else:
-        await chat.reply_text(text + "\n\n⚠️ Admin has not set QR yet. Admin use /setqr")
-
-async def paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Usage: /paid <topup_id> (attach screenshot)")
-        return
-    topup_id = int(context.args[0])
-
-    proof_file_id = None
-    if update.message.photo:
-        proof_file_id = update.message.photo[-1].file_id
-    elif update.message.document:
-        proof_file_id = update.message.document.file_id
-
-    row = get_topup(topup_id)
-    if not row:
-        await update.message.reply_text("Topup not found.")
+    if txt == "💰 Balance":
+        bal = get_balance(user_id)
+        await update.message.reply_text(f"💳 Balance: {money(bal)}", reply_markup=MAIN_MENU)
         return
 
-    _id, owner_id, status, _proof = row
-    if int(owner_id) != int(user_id):
-        await update.message.reply_text("That topup ID is not yours.")
-        return
-    if status != "PENDING":
-        await update.message.reply_text(f"Topup already {status}.")
-        return
-
-    attach_topup_proof(topup_id, proof_file_id or "")
-    await update.message.reply_text("✅ Proof received. Waiting for admin approval.")
-
-    for admin_id in ADMIN_IDS:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=f"🧾 Topup proof submitted\nTopup #{topup_id}\nUser: {user_id}\nApprove: /approve {topup_id} <amount>"
+    if txt == "💬 Chat Admin":
+        await update.message.reply_text(
+            f"Message admin here: {ADMIN_USERNAME}\n👉 https://t.me/{ADMIN_USERNAME.replace('@','')}",
+            reply_markup=MAIN_MENU
         )
-        if proof_file_id:
-            try:
-                await context.bot.send_photo(chat_id=admin_id, photo=proof_file_id)
-            except:
-                pass
+        return
 
-async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if txt == "❌ Cancel Order":
+        context.user_data.pop("pending_order", None)
+        context.user_data.pop("selected_variant", None)
+        await update.message.reply_text("✅ Order cancelled. No payment deducted.", reply_markup=MAIN_MENU)
+        return
+
+    if txt == "📦 List Produk":
+        products = list_products()
+        if not products:
+            await update.message.reply_text("No products yet.", reply_markup=MAIN_MENU)
+            return
+
+        # numbered list buttons (1..n)
+        buttons = []
+        row = []
+        text_lines = ["📦 Product List\n━━━━━━━━━━━━━━"]
+        for idx, (pid, pname) in enumerate(products, start=1):
+            _cat, title = parse_product(pname)
+            text_lines.append(f"{idx}. {title}")
+            row.append(InlineKeyboardButton(str(idx), callback_data=f"p:{pid}"))
+            if len(row) == 6:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        await update.message.reply_text(
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+# ================== CALLBACKS ==================
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    user_id = update.effective_user.id
+    ensure_user(user_id)
+
+    # select product
+    if data.startswith("p:"):
+        product_id = int(data.split(":")[1])
+        variants = list_variants(product_id)
+        if not variants:
+            await q.message.reply_text("No packages yet.")
+            return
+
+        buttons = []
+        for vid, vname, price, file_id in variants:
+            stock_label = "∞" if file_id else str(count_stock(vid))
+            buttons.append([InlineKeyboardButton(
+                f"{vname} — {money(price)} (Stock: {stock_label})",
+                callback_data=f"v:{vid}"
+            )])
+
+        await q.message.reply_text(
+            "Choose package:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # select variant => ask quantity
+    if data.startswith("v:"):
+        variant_id = int(data.split(":")[1])
+        context.user_data["selected_variant"] = variant_id
+        await q.message.reply_text("Enter quantity (1–50):", reply_markup=CANCEL_MENU)
+        return
+# confirm order
+    if data.startswith("confirm:"):
+        _, variant_id_s, qty_s = data.split(":")
+        variant_id = int(variant_id_s)
+        qty = int(qty_s)
+
+        context.user_data.pop("pending_order", None)
+
+        row = get_variant(variant_id)
+        if not row:
+            await q.message.reply_text("Package not found.", reply_markup=MAIN_MENU)
+            return
+
+        _vid, vname, price, file_id, product_full = row
+        _cat, product_title = parse_product(product_full)
+
+        total = int(price) * qty
+
+        # Check stock for non-file products
+        if not file_id:
+            if count_stock(variant_id) < qty:
+                await q.message.reply_text("❌ Not enough stock.", reply_markup=MAIN_MENU)
+                return
+
+        # Deduct only on confirm
+        ok = deduct_balance_if_enough(user_id, total)
+        if not ok:
+            bal = get_balance(user_id)
+            await q.message.reply_text(f"❌ Need {money(total)}, you have {money(bal)}.", reply_markup=MAIN_MENU)
+            return
+
+        # Deliver
+        caption = (
+            "✅ Purchase Successful\n"
+            f"📦 {product_title} — {vname}\n"
+            f"Qty: {qty}\n"
+            f"Total: {money(total)}\n\n"
+            f"Need help? {ADMIN_USERNAME}"
+        )
+
+        if file_id:
+            if qty == 1:
+                await q.message.reply_document(document=file_id, caption=caption)
+                await q.message.reply_text("Back to menu:", reply_markup=MAIN_MENU)
+                return
+
+            # ZIP bundle
+            tg_file = await context.bot.get_file(file_id)
+            data_bytes = await tg_file.download_as_bytearray()
+
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+                for i in range(1, qty + 1):
+                    z.writestr(f"{product_title}_{vname}_{i}.bin", bytes(data_bytes))
+
+            mem.seek(0)
+            await q.message.reply_document(
+                document=mem,
+                filename=f"{product_title}_{vname}_x{qty}.zip",
+                caption=caption + "\n\n📦 Sent as ZIP bundle."
+            )
+            await q.message.reply_text("Back to menu:", reply_markup=MAIN_MENU)
+            return
+
+        # Stock item delivery
+        payloads = take_stock_payloads(variant_id, qty, user_id)
+        if not payloads:
+            add_balance(user_id, total)
+            await q.message.reply_text("❌ Stock changed. Payment refunded. Try again.", reply_markup=MAIN_MENU)
+            return
+
+        await q.message.reply_text(
+            caption + "\n\n📦 Delivery:\n" + "\n".join(payloads),
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    # cancel confirm
+    if data == "cancel_confirm":
+        context.user_data.pop("pending_order", None)
+        await q.message.reply_text("✅ Order cancelled. No payment deducted.", reply_markup=MAIN_MENU)
+        return
+
+# ================== QTY INPUT ==================
+async def buy_qty_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+
+    # ignore menu texts
+    if txt in ["📦 List Produk", "💰 Balance", "💬 Chat Admin", "❌ Cancel Order"]:
+        return
+
+    if "selected_variant" not in context.user_data:
+        return
+
+    user_id = update.effective_user.id
+    ensure_user(user_id)
+
+    try:
+        qty = int(txt)
+        if qty < 1 or qty > 50:
+            await update.message.reply_text("Qty must be 1–50.", reply_markup=CANCEL_MENU)
+            return
+    except:
+        await update.message.reply_text("Please enter a number (1–50).", reply_markup=CANCEL_MENU)
+        return
+
+    variant_id = int(context.user_data.pop("selected_variant"))
+
+    row = get_variant(variant_id)
+    if not row:
+        await update.message.reply_text("Package not found.", reply_markup=MAIN_MENU)
+        return
+
+    _vid, vname, price, file_id, product_full = row
+    _cat, product_title = parse_product(product_full)
+
+    total = int(price) * qty
+    bal = get_balance(user_id)
+if bal < total:
+        await update.message.reply_text(f"❌ Need {money(total)}, you have {money(bal)}.", reply_markup=MAIN_MENU)
+        return
+
+    if not file_id:
+        stock = count_stock(variant_id)
+        if stock < qty:
+            await update.message.reply_text(f"❌ Not enough stock. Available: {stock}", reply_markup=MAIN_MENU)
+            return
+
+    # pending confirm (NO DEDUCT YET)
+    context.user_data["pending_order"] = {"variant_id": variant_id, "qty": qty}
+
+    buttons = [
+        [InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:{variant_id}:{qty}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_confirm")],
+    ]
+
+    await update.message.reply_text(
+        "🧾 Confirm Order\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📦 {product_title} — {vname}\n"
+        f"Qty: {qty}\n"
+        f"Total: {money(total)}\n\n"
+        "Payment will be deducted ONLY after you confirm.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# ================== ADMIN COMMANDS ==================
+async def addproduct_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /approve <topup_id> <amount>")
+
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("Usage: /addproduct <Category | Product Name>")
         return
 
-    topup_id = int(context.args[0])
-    amount = int(context.args[1])
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("INSERT INTO products(name) VALUES(%s) RETURNING id", (name,))
+        pid = cur.fetchone()[0]
+        db.commit()
 
-    credited_user_id = approve_topup(topup_id, amount)
-    if not credited_user_id:
-        await update.message.reply_text("❌ Topup not found or not pending.")
-        return
+    await update.message.reply_text(f"✅ Product added. ID: {pid}")
 
-    await update.message.reply_text(f"✅ Approved topup #{topup_id}, credited {money(amount)}.")
-    await context.bot.send_message(chat_id=credited_user_id, text=f"✅ Topup approved. +{money(amount)}")
-
-# Admin: set QR (send photo with /setqr first, then send image)
-async def setqr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addvariant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    context.user_data["awaiting_qr"] = True
-    await update.message.reply_text("✅ Now send your QR image (as PHOTO).")
 
-async def capture_qr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: /addvariant <product_id> <price> <variant name...>")
+        return
+
+    product_id = int(context.args[0])
+    price = int(context.args[1])
+    name = " ".join(context.args[2:]).strip()
+
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO variants(product_id,name,price) VALUES(%s,%s,%s) RETURNING id",
+            (product_id, name, price)
+        )
+        vid = cur.fetchone()[0]
+        db.commit()
+
+    await update.message.reply_text(f"✅ Variant added. ID: {vid}")
+
+async def addstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if not context.user_data.get("awaiting_qr"):
-        return
-    if not update.message.photo:
-        await update.message.reply_text("❌ Send as PHOTO (not text).")
-        return
-    file_id = update.message.photo[-1].file_id
-    set_setting("PAYMENT_QR_FILE_ID", file_id)
-    context.user_data["awaiting_qr"] = False
-    await update.message.reply_text("✅ QR saved! /topup will show it now.")
 
-async def setpaytext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not context.args:
+        await update.message.reply_text("Usage:\n/addstock <variant_id>\n<one item per line>")
         return
-    text = update.message.text.replace("/setpaytext", "", 1).strip()
-    if not text:
-        await update.message.reply_text("Usage:\n/setpaytext <your instructions>")
-        return
-    set_setting("PAYMENT_TEXT", text)
-    await update.message.reply_text("✅ Payment instructions saved!")
 
-# Admin: set file delivery for a variant
+    variant_id = int(context.args[0])
+    lines = update.message.text.splitlines()
+    if len(lines) < 2:
+        await update.message.reply_text("Put items on the next lines (one per line).")
+        return
+
+    items = [ln.strip() for ln in lines[1:] if ln.strip()]
+    if not items:
+        await update.message.reply_text("No items found.")
+        return
+
+    with connect() as db:
+        cur = db.cursor()
+        for it in items:
+            cur.execute(
+                "INSERT INTO inventory_items(variant_id,payload,status) VALUES(%s,%s,'available')",
+                (variant_id, it)
+            )
+        db.commit()
+
+    await update.message.reply_text(f"✅ Added {len(items)} stock items.")
+
 async def setfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+
     if not context.args:
         await update.message.reply_text("Usage: /setfile <variant_id> (attach file as Document)")
         return
+
     if not update.message.document:
-        await update.message.reply_text("Attach the file as Document with caption: /setfile <variant_id>")
+        await update.message.reply_text("Attach a file as Document with caption: /setfile <variant_id>")
         return
+
     variant_id = int(context.args[0])
     file_id = update.message.document.file_id
     set_variant_file(variant_id, file_id)
-    await update.message.reply_text("✅ File auto-delivery set.")
-
-# ---------------- MAIN ----------------
+    await update.message.reply_text(f"✅ Auto-delivery file set for variant {variant_id}.")
+# ================== MAIN ==================
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("version", version_cmd))
 
-    app.add_handler(CommandHandler("topup", topup_cmd))
-    app.add_handler(CommandHandler("paid", paid_cmd))
-    app.add_handler(CommandHandler("approve", approve_cmd))
-
-    app.add_handler(CommandHandler("setqr", setqr_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO, capture_qr_photo))
-    app.add_handler(CommandHandler("setpaytext", setpaytext_cmd))
-
+    # admin
+    app.add_handler(CommandHandler("addproduct", addproduct_cmd))
+    app.add_handler(CommandHandler("addvariant", addvariant_cmd))
+    app.add_handler(CommandHandler("addstock", addstock_cmd))
     app.add_handler(CommandHandler("setfile", setfile_cmd))
 
+    # callbacks
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    # menu + qty input
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, buy_qty_message))
 
     print("Starting bot...")
     app.run_polling()
 
-if __name__ == "__main__":
+if name == "main":
     main()
