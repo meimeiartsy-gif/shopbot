@@ -4,126 +4,158 @@ from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing. Add it in Railway Variables.")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing (Railway → Variables)")
+
+def connect():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
+# =========================
+# INIT + AUTO MIGRATION
+# =========================
 def init_db():
-    """Create tables if they don't exist."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                balance INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            """)
+    with connect() as db:
+        cur = db.cursor()
 
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS topups (
-                id SERIAL PRIMARY KEY,
-                topup_id TEXT UNIQUE NOT NULL,
-                user_id BIGINT NOT NULL,
-                amount INTEGER NOT NULL,
-                method TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                proof_file_id TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            """)
+        # USERS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            balance INTEGER NOT NULL DEFAULT 0
+        );
+        """)
 
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-            """)
+        # PRODUCTS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT ''
+        );
+        """)
 
-            conn.commit()
+        # VARIANTS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS variants (
+            id SERIAL PRIMARY KEY,
+            product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            telegram_file_id TEXT
+        );
+        """)
 
-def upsert_user(user_id: int, username: str | None):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO users (user_id, username)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-            """, (user_id, username))
-            conn.commit()
+        # STOCK / ACCOUNTS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_items (
+            id SERIAL PRIMARY KEY,
+            variant_id INTEGER REFERENCES variants(id) ON DELETE CASCADE,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'available',
+            sold_to BIGINT,
+            sold_at TIMESTAMP
+        );
+        """)
+
+        # TOPUPS (IMPORTANT)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS topups (
+            id SERIAL PRIMARY KEY,
+            topup_id TEXT UNIQUE,
+            user_id BIGINT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 0,
+            method TEXT NOT NULL DEFAULT 'gcash',
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            proof_file_id TEXT,
+            admin_id BIGINT,
+            decided_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        """)
+
+        # SETTINGS (TEXT, QR, ANNOUNCEMENTS)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """)
+
+        db.commit()
+
+    migrate_db()
+
+# =========================
+# AUTO MIGRATION (NO SHELL)
+# =========================
+def migrate_db():
+    with connect() as db:
+        cur = db.cursor()
+
+        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS topup_id TEXT;")
+        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS amount INTEGER DEFAULT 0;")
+        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS method TEXT DEFAULT 'gcash';")
+        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS proof_file_id TEXT;")
+        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS admin_id BIGINT;")
+        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS decided_at TIMESTAMP;")
+
+        cur.execute("""
+        UPDATE topups
+        SET topup_id = 'shopnluna:TU' || SUBSTRING(MD5(RANDOM()::text) FROM 1 FOR 10)
+        WHERE topup_id IS NULL;
+        """)
+
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS topups_topup_id_uq
+        ON topups(topup_id);
+        """)
+
+        db.commit()
+
+# =========================
+# USERS
+# =========================
+def ensure_user(user_id: int):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO users (user_id, balance) VALUES (%s, 0) ON CONFLICT DO NOTHING",
+            (user_id,)
+        )
+        db.commit()
 
 def get_balance(user_id: int) -> int:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT balance FROM users WHERE user_id=%s", (user_id,))
-            row = cur.fetchone()
-            return int(row[0]) if row else 0
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("SELECT balance FROM users WHERE user_id=%s", (user_id,))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+        def add_balance(user_id: int, amount: int):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE users SET balance = balance + %s WHERE user_id=%s",
+            (amount, user_id)
+        )
+        db.commit()
 
-def add_balance(user_id: int, amount: int):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE users SET balance = balance + %s WHERE user_id=%s
-            """, (amount, user_id))
-            conn.commit()
-
+# =========================
+# SETTINGS (TEXT / QR)
+# =========================
 def set_setting(key: str, value: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO settings (key, value)
-                VALUES (%s, %s)
-                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
-            """, (key, value))
-            conn.commit()
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("""
+            INSERT INTO settings (key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key)
+            DO UPDATE SET value = EXCLUDED.value
+        """, (key, value))
+        db.commit()
 
-def get_setting(key: str) -> str | None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
-            row = cur.fetchone()
-            return row[0] if row else None
-
-def create_topup(topup_id: str, user_id: int, amount: int, method: str, proof_file_id: str | None):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO topups (topup_id, user_id, amount, method, proof_file_id)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (topup_id, user_id, amount, method, proof_file_id))
-            conn.commit()
-
-def list_pending_topups(limit: int = 20):
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT * FROM topups WHERE status='pending'
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (limit,))
-            return cur.fetchall()
-
-def approve_topup(topup_id: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # get info
-            cur.execute("SELECT user_id, amount FROM topups WHERE topup_id=%s AND status='pending'", (topup_id,))
-            row = cur.fetchone()
-            if not row:
-                return False
-            user_id, amount = row[0], row[1]
-
-            # approve
-            cur.execute("UPDATE topups SET status='approved' WHERE topup_id=%s", (topup_id,))
-            cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
-            conn.commit()
-            return True
-
-def reject_topup(topup_id: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE topups SET status='rejected' WHERE topup_id=%s AND status='pending'", (topup_id,))
-            conn.commit()
-            return cur.rowcount > 0
+def get_setting(key: str):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
