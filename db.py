@@ -38,6 +38,17 @@ def init_db():
         );
         """)
 
+        # products table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            delivery_type TEXT NOT NULL DEFAULT 'MANUAL', -- FILE or MANUAL
+            telegram_file_id TEXT
+        );
+        """)
+
         db.commit()
 
 # ================= USERS =================
@@ -124,3 +135,36 @@ def approve_topup(topup_id: int):
         cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
         db.commit()
         return int(user_id), int(amount)
+
+# ================= PRODUCTS =================
+def add_product(name: str, price: int) -> int:
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO products(name, price) VALUES(%s, %s) RETURNING id",
+            (name, price)
+        )
+        pid = cur.fetchone()[0]
+        db.commit()
+        return int(pid)
+
+def list_products():
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("SELECT id, name, price FROM products ORDER BY id ASC")
+        return cur.fetchall()
+
+def get_product(pid: int):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute("SELECT id, name, price, delivery_type, telegram_file_id FROM products WHERE id=%s", (pid,))
+        return cur.fetchone()
+
+def set_product_file(pid: int, file_id: str):
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE products SET delivery_type='FILE', telegram_file_id=%s WHERE id=%s",
+            (file_id, pid)
+        )
+        db.commit()
