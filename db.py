@@ -1,21 +1,63 @@
 import os
 import psycopg
 from psycopg.rows import dict_row
-from datetime import datetime, timezone
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-def now_utc():
-    return datetime.now(timezone.utc)
 
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is missing.")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
+
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+
+            # ---- MIGRATIONS (fix old schemas) ----
+            # If your old products table uses "id" instead of "product_id", rename it.
+            cur.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='products' AND column_name='id'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='products' AND column_name='product_id'
+                )
+                THEN
+                    ALTER TABLE products RENAME COLUMN id TO product_id;
+                END IF;
+            END $$;
+            """)
+
+            # If your old users table uses "id" instead of "user_id", rename it (just in case)
+            cur.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='users' AND column_name='id'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='users' AND column_name='user_id'
+                )
+                THEN
+                    ALTER TABLE users RENAME COLUMN id TO user_id;
+                END IF;
+            END $$;
+            """)
+
+            # ---- TABLES ----
+
             # Users
             cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -27,7 +69,7 @@ def init_db():
             );
             """)
 
-            # Settings: editable texts + QR file_ids + captions
+            # Settings
             cur.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -35,7 +77,7 @@ def init_db():
             );
             """)
 
-            # Products
+            # Products (now guaranteed to have product_id)
             cur.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 product_id SERIAL PRIMARY KEY,
@@ -83,6 +125,7 @@ def init_db():
 
     seed_default_settings()
 
+
 def seed_default_settings():
     defaults = {
         "welcome_text": "🌙 Luna’s Prem Shop\n──────────────\n💳 Balance: ₱{balance}\n\nChoose an option:",
@@ -107,6 +150,7 @@ def seed_default_settings():
                 """, (k, v))
             conn.commit()
 
+
 def upsert_user(user_id: int, username: str | None):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -117,11 +161,13 @@ def upsert_user(user_id: int, username: str | None):
             """, (user_id, username))
             conn.commit()
 
+
 def get_user(user_id: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE user_id=%s;", (user_id,))
             return cur.fetchone()
+
 
 def set_balance(user_id: int, new_balance: int):
     with get_conn() as conn:
@@ -129,11 +175,13 @@ def set_balance(user_id: int, new_balance: int):
             cur.execute("UPDATE users SET balance=%s WHERE user_id=%s;", (new_balance, user_id))
             conn.commit()
 
+
 def add_balance(user_id: int, amount: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s;", (amount, user_id))
             conn.commit()
+
 
 def get_setting(key: str) -> str:
     with get_conn() as conn:
@@ -141,6 +189,7 @@ def get_setting(key: str) -> str:
             cur.execute("SELECT value FROM settings WHERE key=%s;", (key,))
             row = cur.fetchone()
             return row["value"] if row else ""
+
 
 def set_setting(key: str, value: str):
     with get_conn() as conn:
@@ -151,6 +200,7 @@ def set_setting(key: str, value: str):
             """, (key, value))
             conn.commit()
 
+
 def list_products(active_only=True):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -160,11 +210,13 @@ def list_products(active_only=True):
                 cur.execute("SELECT * FROM products ORDER BY product_id ASC;")
             return cur.fetchall()
 
+
 def get_product(pid: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM products WHERE product_id=%s;", (pid,))
             return cur.fetchone()
+
 
 def create_product(name: str, description: str, price: int, stock: int, delivery_file_id: str | None):
     with get_conn() as conn:
@@ -178,6 +230,7 @@ def create_product(name: str, description: str, price: int, stock: int, delivery
             conn.commit()
             return pid
 
+
 def update_product(pid: int, **fields):
     allowed = {"name", "description", "price", "stock", "delivery_file_id", "active"}
     keys = [k for k in fields.keys() if k in allowed]
@@ -190,11 +243,13 @@ def update_product(pid: int, **fields):
             cur.execute(f"UPDATE products SET {sets} WHERE product_id=%s;", vals)
             conn.commit()
 
+
 def delete_product(pid: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM products WHERE product_id=%s;", (pid,))
             conn.commit()
+
 
 def create_topup(topup_id: str, user_id: int, amount: int, method: str):
     with get_conn() as conn:
@@ -208,8 +263,8 @@ def create_topup(topup_id: str, user_id: int, amount: int, method: str):
             conn.commit()
             return tid
 
+
 def attach_topup_proof(user_id: int, proof_file_id: str):
-    # attach proof to latest pending topup for that user
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -226,11 +281,13 @@ def attach_topup_proof(user_id: int, proof_file_id: str):
             conn.commit()
             return topup_db_id
 
+
 def get_topup_by_dbid(topup_db_id: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM topups WHERE topup_db_id=%s;", (topup_db_id,))
             return cur.fetchone()
+
 
 def approve_topup(topup_db_id: int, admin_id: int):
     with get_conn() as conn:
@@ -240,9 +297,7 @@ def approve_topup(topup_db_id: int, admin_id: int):
             if not t or t["status"] != "PENDING":
                 return None
 
-            # add balance
             cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s;", (t["amount"], t["user_id"]))
-
             cur.execute("""
             UPDATE topups
             SET status='APPROVED', approved_by=%s, approved_at=NOW()
@@ -251,6 +306,7 @@ def approve_topup(topup_db_id: int, admin_id: int):
 
             conn.commit()
             return t
+
 
 def reject_topup(topup_db_id: int, admin_id: int):
     with get_conn() as conn:
@@ -269,6 +325,7 @@ def reject_topup(topup_db_id: int, admin_id: int):
             conn.commit()
             return t
 
+
 def list_pending_topups(limit=50):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -282,7 +339,8 @@ def list_pending_topups(limit=50):
             """, (limit,))
             return cur.fetchall()
 
-def list_users(limit=50000):
+
+def list_users():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM users WHERE is_banned=FALSE;")
