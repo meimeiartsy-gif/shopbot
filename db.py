@@ -1,12 +1,15 @@
 import os
 import psycopg2
+from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+
 def connect():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing. Add it in Railway Variables (Reference your Postgres DATABASE_URL).")
+        raise RuntimeError("DATABASE_URL is missing. Add it in Railway Variables.")
     return psycopg2.connect(DATABASE_URL)
+
 
 def init_db():
     with connect() as db:
@@ -51,9 +54,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS topups (
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 0,
+            method TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'PENDING',
-            amount INTEGER DEFAULT 0,
-            method TEXT DEFAULT '',
             proof_file_id TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         );
@@ -66,13 +69,8 @@ def init_db():
         );
         """)
 
-        # Safe upgrades if old table existed
-        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS amount INTEGER DEFAULT 0;")
-        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS method TEXT DEFAULT '';")
-        cur.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();")
-        cur.execute("ALTER TABLE variants ADD COLUMN IF NOT EXISTS telegram_file_id TEXT;")
-
         db.commit()
+
 
 def ensure_user(user_id: int):
     with connect() as db:
@@ -83,6 +81,7 @@ def ensure_user(user_id: int):
         )
         db.commit()
 
+
 def get_balance(user_id: int) -> int:
     with connect() as db:
         cur = db.cursor()
@@ -90,25 +89,16 @@ def get_balance(user_id: int) -> int:
         row = cur.fetchone()
         return int(row[0]) if row else 0
 
+
 def add_balance(user_id: int, amount: int):
     with connect() as db:
         cur = db.cursor()
-        cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
+        cur.execute(
+            "UPDATE users SET balance = balance + %s WHERE user_id=%s",
+            (amount, user_id)
+        )
         db.commit()
 
-def deduct_balance(user_id: int, amount: int) -> bool:
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute(
-            "UPDATE users SET balance = balance - %s WHERE user_id=%s AND balance >= %s",
-            (amount, user_id, amount)
-        )
-        ok = (cur.rowcount == 1)
-        if ok:
-            db.commit()
-        else:
-            db.rollback()
-        return ok
 
 def set_setting(key: str, value: str):
     with connect() as db:
@@ -120,6 +110,7 @@ def set_setting(key: str, value: str):
         """, (key, value))
         db.commit()
 
+
 def get_setting(key: str):
     with connect() as db:
         cur = db.cursor()
@@ -127,42 +118,86 @@ def get_setting(key: str):
         row = cur.fetchone()
         return row[0] if row else None
 
-# ---- Topups ----
+
+# ---------- TOPUPS ----------
 def create_topup(user_id: int, amount: int, method: str) -> int:
     with connect() as db:
         cur = db.cursor()
         cur.execute(
-            "INSERT INTO topups(user_id,status,amount,method) VALUES(%s,'PENDING',%s,%s) RETURNING id",
+            "INSERT INTO topups(user_id, amount, method, status) VALUES(%s,%s,%s,'PENDING') RETURNING id",
             (user_id, amount, method)
         )
-        tid = cur.fetchone()[0]
+        topup_id = cur.fetchone()[0]
         db.commit()
-        return int(tid)
+        return int(topup_id)
 
-def attach_topup_proof(topup_id: int, proof_file_id: str):
+
+def attach_topup_proof(topup_id: int, proof_file_id: str) -> bool:
     with connect() as db:
         cur = db.cursor()
-        cur.execute("UPDATE topups SET proof_file_id=%s WHERE id=%s", (proof_file_id, topup_id))
+        cur.execute(
+            "UPDATE topups SET proof_file_id=%s WHERE id=%s AND status='PENDING'",
+            (proof_file_id, topup_id)
+        )
+        ok = (cur.rowcount == 1)
         db.commit()
+        return ok
+
 
 def get_topup(topup_id: int):
     with connect() as db:
         cur = db.cursor()
-        cur.execute("SELECT id, user_id, status, amount, method, proof_file_id FROM topups WHERE id=%s", (topup_id,))
+        cur.execute(
+            "SELECT id, user_id, amount, method, status, proof_file_id, created_at FROM topups WHERE id=%s",
+            (topup_id,)
+        )
         return cur.fetchone()
 
-def approve_topup(topup_id: int) -> int | None:
+
+def approve_topup(topup_id: int):
+    """
+    Marks topup APPROVED and credits the user with stored amount.
+    Returns (user_id, amount) if success else None.
+    """
     with connect() as db:
         cur = db.cursor()
-        cur.execute("SELECT user_id, status, amount FROM topups WHERE id=%s", (topup_id,))
+        cur.execute(
+            "SELECT user_id, amount, status FROM topups WHERE id=%s",
+            (topup_id,)
+        )
         row = cur.fetchone()
         if not row:
             return None
-        user_id, status, amount = row
+        user_id, amount, status = row
         if status != "PENDING":
             return None
 
         cur.execute("UPDATE topups SET status='APPROVED' WHERE id=%s", (topup_id,))
-        cur.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, user_id))
+        cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
         db.commit()
-        return int(user_id)
+        return int(user_id), int(amount)
+
+
+def reject_topup(topup_id: int) -> bool:
+    with connect() as db:
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE topups SET status='REJECTED' WHERE id=%s AND status='PENDING'",
+            (topup_id,)
+        )
+        ok = (cur.rowcount == 1)
+        db.commit()
+        return ok
+
+
+def list_pending_topups(limit: int = 10):
+    with connect() as db:
+        cur = db.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT id, user_id, amount, method, status, created_at
+            FROM topups
+            WHERE status='PENDING'
+            ORDER BY id DESC
+            LIMIT %s
+        """, (limit,))
+        return cur.fetchall()
