@@ -1,469 +1,661 @@
 import os
 import random
 import string
-from datetime import datetime
-
-from dotenv import load_dotenv
+import logging
 from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    Update, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
-from db import (
-    connect,
-    init_db,
-    ensure_user,
-    get_balance,
-    set_setting,
-    get_setting,
-)
+import db
 
-# ================== ENV ==================
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@lovebylunaa").strip()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("shopbot")
 
-if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing in Railway Variables")
+ADMIN_USERNAMES = [u.strip().lstrip("@").lower() for u in os.getenv("ADMIN_USERNAMES", "lovebylunaa").split(",") if u.strip()]
 
-SHOP_NAME = "🌙 Luna’s Prem Shop"
+AMOUNTS = [50, 100, 300, 500, 1000]
 
-# ================== HELPERS ==================
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def is_admin(user) -> bool:
+    username = (user.username or "").lower()
+    return username in ADMIN_USERNAMES
+
+def topup_id():
+    # SHOPNLUNA-6-TU3SM4 style
+    part1 = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    part2 = str(random.randint(1, 9))
+    return f"SHOPNLUNA-{part2}-{part1}"
 
 def money(n: int) -> str:
-    return f"₱{int(n):,}"
+    return f"₱{n}"
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📦 List Produk"), KeyboardButton("💰 Balance")],
-            [KeyboardButton("➕ Add Balance"), KeyboardButton("💬 Chat Admin")],
-            [KeyboardButton("❌ Cancel")],
-        ],
-        resize_keyboard=True
-    )
+def main_menu_kb(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("📦 List Produk"), KeyboardButton("💰 Balance")],
+        [KeyboardButton("➕ Add Balance"), KeyboardButton("💬 Chat Admin")],
+    ]
+    if is_admin_user:
+        rows.append([KeyboardButton("🛠️ Admin Panel")])
+    rows.append([KeyboardButton("❌ Cancel")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def random_code(n=6) -> str:
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
-
-def make_topup_code(topup_id: int) -> str:
-    return f"SHOPNLUNA-{topup_id}-{random_code(6)}"
-
-# ================== DB: TOPUPS ==================
-def create_topup(user_id: int, amount: int, method: str) -> tuple[int, str]:
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute(
-            "INSERT INTO topups(user_id,status,proof_file_id) VALUES(%s,'PENDING','') RETURNING id",
-            (user_id,)
-        )
-        topup_id = int(cur.fetchone()[0])
-        topup_code = make_topup_code(topup_id)
-
-        set_setting(f"TOPUP:{topup_id}:CODE", topup_code)
-        set_setting(f"TOPUP:{topup_id}:AMOUNT", str(int(amount)))
-        set_setting(f"TOPUP:{topup_id}:METHOD", method)
-
-        db.commit()
-        return topup_id, topup_code
-
-def set_topup_proof(topup_id: int, proof_file_id: str):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("UPDATE topups SET proof_file_id=%s WHERE id=%s", (proof_file_id, topup_id))
-        db.commit()
-
-def get_topup_row(topup_id: int):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("SELECT id, user_id, status, proof_file_id FROM topups WHERE id=%s", (topup_id,))
-        return cur.fetchone()
-
-def list_pending_topups(limit: int = 20):
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute(
-            "SELECT id, user_id, proof_file_id FROM topups WHERE status='PENDING' ORDER BY id DESC LIMIT %s",
-            (limit,)
-        )
-        return cur.fetchall()
-
-def approve_topup_db(topup_id: int) -> tuple[int, int, str] | None:
-    row = get_topup_row(topup_id)
-    if not row:
-        return None
-    _id, user_id, status, _proof = row
-    if status != "PENDING":
-        return None
-
-    amount = int(get_setting(f"TOPUP:{topup_id}:AMOUNT") or "0")
-    code = get_setting(f"TOPUP:{topup_id}:CODE") or f"TOPUP-{topup_id}"
-    if amount <= 0:
-        return None
-
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("UPDATE topups SET status='APPROVED' WHERE id=%s", (topup_id,))
-        cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
-        db.commit()
-
-    return int(user_id), amount, code
-
-def reject_topup_db(topup_id: int) -> tuple[int, str] | None:
-    row = get_topup_row(topup_id)
-    if not row:
-        return None
-    _id, user_id, status, _proof = row
-    if status != "PENDING":
-        return None
-    code = get_setting(f"TOPUP:{topup_id}:CODE") or f"TOPUP-{topup_id}"
-    with connect() as db:
-        cur = db.cursor()
-        cur.execute("UPDATE topups SET status='REJECTED' WHERE id=%s", (topup_id,))
-        db.commit()
-    return int(user_id), code
-
-# ================== STARTUP ==================
-async def on_startup(app: Application):
-    init_db()
-
-# ================== BASIC ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-    bal = get_balance(user_id)
-
-    text = (
-        f"{SHOP_NAME}\n"
-        "━━━━━━━━━━━━━━\n"
-        f"💳 Balance: {money(bal)}\n\n"
-        "Choose an option:"
+    user = update.effective_user
+    db.upsert_user(user.id, user.username)
+    u = db.get_user(user.id)
+    welcome_tpl = db.get_setting("welcome_text")
+    text = welcome_tpl.format(balance=u["balance"])
+    await update.message.reply_text(
+        text,
+        reply_markup=main_menu_kb(is_admin(user)),
+        parse_mode=ParseMode.MARKDOWN
     )
-    await update.message.reply_text(text, reply_markup=main_menu_kb())
 
-async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-    bal = get_balance(user_id)
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("✅ Cancelled.", reply_markup=main_menu_kb(is_admin(update.effective_user)))
+
+async def list_produk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products = db.list_products(active_only=True)
+    header = db.get_setting("product_list_header")
+    if not products:
+        await update.message.reply_text(db.get_setting("no_products_text"))
+        return
+
+    lines = [header, ""]
+    for p in products:
+        lines.append(f"*{p['product_id']}* — {p['name']}")
+        if p["description"]:
+            lines.append(f"_{p['description']}_")
+        lines.append(f"Price: {money(p['price'])} | Stock: {p['stock']}")
+        lines.append("")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = db.get_user(user.id)
+    await update.message.reply_text(f"💰 Your balance: {money(u['balance'])}")
+
+async def chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_username = ADMIN_USERNAMES[0] if ADMIN_USERNAMES else "lovebylunaa"
+    txt = db.get_setting("chat_admin_text").format(admin_username=admin_username)
+    await update.message.reply_text(txt)
+
+async def add_balance_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # show amount buttons inline
+    admin_username = ADMIN_USERNAMES[0] if ADMIN_USERNAMES else "lovebylunaa"
+    intro = db.get_setting("add_balance_intro").format(admin_username=admin_username)
+
+    kb = []
+    row = []
+    for a in AMOUNTS:
+        row.append(InlineKeyboardButton(money(a), callback_data=f"topup:amount:{a}"))
+        if len(row) == 3:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="topup:cancel")])
+
+    await update.message.reply_text(intro, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user):
+        await update.message.reply_text("❌ Admin only.")
+        return
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Balance", callback_data="add_balance")],
+        [InlineKeyboardButton("📦 Products", callback_data="admin:products")],
+        [InlineKeyboardButton("💳 Topups", callback_data="admin:topups")],
+        [InlineKeyboardButton("🧾 Orders", callback_data="admin:orders")],
+        [InlineKeyboardButton("👤 Users", callback_data="admin:users")],
+        [InlineKeyboardButton("🛠️ Edit Bot Texts", callback_data="admin:settings")],
+        [InlineKeyboardButton("📢 Make Announcement", callback_data="admin:announce")],
     ])
-    await update.message.reply_text(f"💳 Your balance: {money(bal)}", reply_markup=kb)
+    await update.message.reply_text("🛠️ Admin Panel — choose:", reply_markup=kb)
 
-# ================== ADD BALANCE FLOW ==================
-async def add_balance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("₱50", callback_data="amt:50"),
-         InlineKeyboardButton("₱100", callback_data="amt:100")],
-        [InlineKeyboardButton("₱300", callback_data="amt:300"),
-         InlineKeyboardButton("₱500", callback_data="amt:500")],
-        [InlineKeyboardButton("₱1000", callback_data="amt:1000")],
-    ])
-    msg = update.callback_query.message if update.callback_query else update.message
-    await msg.reply_text("Choose top up amount:", reply_markup=kb)
+# ---------- Admin flows (state machine using context.user_data) ----------
+
+def set_state(context: ContextTypes.DEFAULT_TYPE, state: str, payload: dict | None = None):
+    context.user_data["state"] = state
+    context.user_data["payload"] = payload or {}
+
+def get_state(context: ContextTypes.DEFAULT_TYPE):
+    return context.user_data.get("state"), context.user_data.get("payload", {})
+
+async def ask_text(update: Update, prompt: str):
+    await update.effective_message.reply_text(prompt, parse_mode=ParseMode.MARKDOWN)
+
+# ---------- Callbacks ----------
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    user = update.effective_user
     data = q.data
-    user_id = update.effective_user.id
 
-    if data == "add_balance":
-        await add_balance_menu(update, context)
+    # TOPUP FLOW
+    if data == "topup:cancel":
+        context.user_data.pop("pending_topup", None)
+        await q.message.reply_text("✅ Cancelled topup.")
         return
 
-    if data.startswith("amt:"):
-        amount = int(data.split(":")[1])
-        context.user_data["topup_amount"] = amount
+    if data.startswith("topup:amount:"):
+        amt = int(data.split(":")[-1])
+        context.user_data["pending_topup_amount"] = amt
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🟦 GCash", callback_data="paymethod:GCASH")],
-            [InlineKeyboardButton("🟩 GoTyme", callback_data="paymethod:GOTYME")],
+            [InlineKeyboardButton("GCash", callback_data="topup:method:gcash"),
+             InlineKeyboardButton("GoTyme", callback_data="topup:method:gotyme")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="topup:cancel")]
         ])
-        await q.message.reply_text(f"Choose payment method for {money(amount)}:", reply_markup=kb)
+        await q.message.reply_text(f"Amount: {money(amt)}\nChoose payment method:", reply_markup=kb)
         return
 
-    if data.startswith("paymethod:"):
-        method = data.split(":", 1)[1]
-        amount = int(context.user_data.get("topup_amount") or 0)
-        if amount <= 0:
-            await q.message.reply_text("Please choose amount again.")
-            await add_balance_menu(update, context)
+    if data.startswith("topup:method:"):
+        method = data.split(":")[-1]
+        amt = context.user_data.get("pending_topup_amount")
+        if not amt:
+            await q.message.reply_text("❌ Please choose amount again.")
             return
 
-        topup_id, topup_code = create_topup(user_id, amount, method)
-        context.user_data["awaiting_proof"] = topup_id
+        tid = topup_id()
+        db.create_topup(tid, user.id, amt, method.upper())
+        context.user_data["pending_topup_id"] = tid
 
-        if method == "GCASH":
-            qr_file_id = get_setting("PAYMENT_QR_GCASH_FILE_ID")
-            caption = get_setting("PAYMENT_QR_GCASH_CAPTION") or "Scan to pay via GCash."
+        admin_username = ADMIN_USERNAMES[0] if ADMIN_USERNAMES else "lovebylunaa"
+        instructions = db.get_setting("topup_instructions").format(admin_username=admin_username)
+
+        # show QR
+        if method == "gcash":
+            file_id = db.get_setting("gcash_qr_file_id")
+            caption = db.get_setting("gcash_caption").format(admin_username=admin_username)
         else:
-            qr_file_id = get_setting("PAYMENT_QR_GOTYME_FILE_ID")
-            caption = get_setting("PAYMENT_QR_GOTYME_CAPTION") or "Scan to pay via GoTyme."
+            file_id = db.get_setting("gotyme_qr_file_id")
+            caption = db.get_setting("gotyme_caption").format(admin_username=admin_username)
 
-        guide = (
-            f"🧾 TOP UP REQUEST\n"
-            "━━━━━━━━━━━━━━\n"
-            f"Amount: {money(amount)}\n"
-            f"Method: {method}\n"
-            f"Topup ID: {topup_code}\n\n"
-            "✅ After payment, send your screenshot here.\n"
-            "⏳ Waiting for admin approval.\n"
-            f"For faster approval, DM admin: {ADMIN_USERNAME}"
-        )
+        await q.message.reply_text(f"Topup ID: *{tid}*\nMethod: *{method.upper()}*\nAmount: *{money(amt)}*", parse_mode=ParseMode.MARKDOWN)
 
-        if qr_file_id:
-            await q.message.reply_photo(photo=qr_file_id, caption=f"{caption}\n\n{guide}")
+        if file_id:
+            await q.message.reply_photo(photo=file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
         else:
-            await q.message.reply_text(
-                f"⚠️ QR for {method} is not set yet.\nAdmin must set it first.\n\n{guide}"
+            await q.message.reply_text("⚠️ QR not set yet. Please contact admin.")
+
+        await q.message.reply_text(instructions, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ADMIN PANEL
+    if data.startswith("admin:"):
+        if not is_admin(user):
+            await q.message.reply_text("❌ Admin only.")
+            return
+        section = data.split(":", 1)[1]
+
+        if section == "products":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add Product", callback_data="adminprod:add")],
+                [InlineKeyboardButton("📄 List Products", callback_data="adminprod:list")],
+                [InlineKeyboardButton("✏️ Edit Product", callback_data="adminprod:edit")],
+                [InlineKeyboardButton("🗑️ Delete Product", callback_data="adminprod:delete")],
+            ])
+            await q.message.reply_text("📦 Products:", reply_markup=kb)
+            return
+
+        if section == "topups":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧾 Pending Topups", callback_data="admintopup:pending")],
+                [InlineKeyboardButton("📜 Topup History (soon)", callback_data="noop")],
+            ])
+            await q.message.reply_text("💳 Topups:", reply_markup=kb)
+            return
+
+        if section == "orders":
+            await q.message.reply_text("🧾 Orders: (you can add later if you want full checkout/delivery flow)")
+            return
+
+        if section == "users":
+            await q.message.reply_text("👤 Users: (you can add later if you want user search, manual balance edit)")
+            return
+
+        if section == "settings":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Welcome Text", callback_data="adminset:welcome_text")],
+                [InlineKeyboardButton("✏️ Product List Header", callback_data="adminset:product_list_header")],
+                [InlineKeyboardButton("✏️ Add Balance Intro", callback_data="adminset:add_balance_intro")],
+                [InlineKeyboardButton("✏️ Topup Instructions", callback_data="adminset:topup_instructions")],
+                [InlineKeyboardButton("✏️ GCash Caption", callback_data="adminset:gcash_caption")],
+                [InlineKeyboardButton("✏️ GoTyme Caption", callback_data="adminset:gotyme_caption")],
+                [InlineKeyboardButton("🖼️ Set GCash QR", callback_data="adminset:gcash_qr")],
+                [InlineKeyboardButton("🖼️ Set GoTyme QR", callback_data="adminset:gotyme_qr")],
+            ])
+            await q.message.reply_text("🛠️ Edit Bot Texts / QR:", reply_markup=kb)
+            return
+
+        if section == "announce":
+            set_state(context, "ADMIN_ANNOUNCE")
+            await q.message.reply_text("📢 Send your announcement text now (it will be sent to all users).")
+            return
+
+    # ADMIN SETTINGS EDIT
+    if data.startswith("adminset:"):
+        if not is_admin(user):
+            await q.message.reply_text("❌ Admin only.")
+            return
+        key = data.split(":", 1)[1]
+
+        if key in {"gcash_qr", "gotyme_qr"}:
+            set_state(context, "ADMIN_SET_QR", {"which": key})
+            await q.message.reply_text("Send the QR as PHOTO (not file). You can add caption too.")
+            return
+
+        # text keys
+        set_state(context, "ADMIN_SET_TEXT", {"key": key})
+        current = db.get_setting(key)
+        await q.message.reply_text(f"Current `{key}`:\n\n{current}\n\nNow send the new text.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ADMIN TOPUP
+    if data == "admintopup:pending":
+        if not is_admin(user):
+            await q.message.reply_text("❌ Admin only.")
+            return
+        pending = db.list_pending_topups(limit=50)
+        if not pending:
+            await q.message.reply_text("✅ No pending topups.")
+            return
+
+        for t in pending:
+            uname = t.get("username") or "(no username)"
+            msg = (
+                f"🧾 *PENDING TOPUP*\n"
+                f"Topup ID: *{t['topup_id']}*\n"
+                f"User: `{t['user_id']}` (@{uname})\n"
+                f"Amount: *{money(t['amount'])}*\n"
+                f"Method: *{t['method']}*\n"
             )
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"topupapprove:{t['topup_db_id']}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"topupreject:{t['topup_db_id']}")
+                ]
+            ])
+            await q.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return
 
-    # ADMIN inline approve/reject
-    if data.startswith("approve:"):
-        if not is_admin(user_id):
+    if data.startswith("topupapprove:"):
+        if not is_admin(user):
             await q.message.reply_text("❌ Admin only.")
             return
-        topup_id = int(data.split(":")[1])
-        approved = approve_topup_db(topup_id)
-        if not approved:
-            await q.message.reply_text("❌ Cannot approve (already processed / missing).")
+        topup_db_id = int(data.split(":")[-1])
+        t = db.approve_topup(topup_db_id, user.id)
+        if not t:
+            await q.message.reply_text("❌ Not found or already handled.")
             return
-        pay_user_id, amount, code = approved
-        await q.message.reply_text(f"✅ Approved {code} (+{money(amount)})")
-        await context.bot.send_message(
-            chat_id=pay_user_id,
-            text=f"✅ Top up approved!\nTopup ID: {code}\nAdded: {money(amount)}"
+        await q.message.reply_text(f"✅ Approved {t['topup_id']} (+{money(t['amount'])})")
+
+        # notify customer
+        try:
+            await context.bot.send_message(
+                chat_id=t["user_id"],
+                text=f"✅ Topup approved!\nTopup ID: {t['topup_id']}\nAmount: {money(t['amount'])}"
+            )
+        except Exception as e:
+            log.warning("Notify user failed: %s", e)
+        return
+
+    if data.startswith("topupreject:"):
+        if not is_admin(user):
+            await q.message.reply_text("❌ Admin only.")
+            return
+        topup_db_id = int(data.split(":")[-1])
+        t = db.reject_topup(topup_db_id, user.id)
+        if not t:
+            await q.message.reply_text("❌ Not found or already handled.")
+            return
+        await q.message.reply_text(f"❌ Rejected {t['topup_id']}")
+
+        try:
+            await context.bot.send_message(
+                chat_id=t["user_id"],
+                text=f"❌ Topup rejected.\nTopup ID: {t['topup_id']}\nIf you believe this is a mistake, DM admin."
+            )
+        except Exception as e:
+            log.warning("Notify user failed: %s", e)
+        return
+
+    # Products (minimal)
+    if data == "adminprod:list":
+        if not is_admin(user):
+            await q.message.reply_text("❌ Admin only.")
+            return
+        products = db.list_products(active_only=False)
+        if not products:
+            await q.message.reply_text("No products yet.")
+            return
+        lines = ["📦 *All Products*", ""]
+        for p in products:
+            lines.append(f"*{p['product_id']}* — {p['name']} | {money(p['price'])} | stock {p['stock']} | active {p['active']}")
+        await q.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "adminprod:add":
+        if not is_admin(user):
+            await q.message.reply_text("❌ Admin only.")
+            return
+        set_state(context, "ADMIN_ADD_PRODUCT", {})
+        await q.message.reply_text(
+            "➕ Add product:\nSend like this:\n\n"
+            "`name | price | stock | description`\n\n"
+            "Example:\n`Netflix 1 month | 100 | 10 | Premium slot`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    if data.startswith("reject:"):
-        if not is_admin(user_id):
+    if data == "adminprod:edit":
+        if not is_admin(user):
             await q.message.reply_text("❌ Admin only.")
             return
-        topup_id = int(data.split(":")[1])
-        rejected = reject_topup_db(topup_id)
-        if not rejected:
-            await q.message.reply_text("❌ Cannot reject (already processed).")
+        set_state(context, "ADMIN_EDIT_PRODUCT_ID", {})
+        await q.message.reply_text("✏️ Send product_id to edit (example: `3`)", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "adminprod:delete":
+        if not is_admin(user):
+            await q.message.reply_text("❌ Admin only.")
             return
-        pay_user_id, code = rejected
-        await q.message.reply_text(f"❌ Rejected {code}")
-        await context.bot.send_message(
-            chat_id=pay_user_id,
-            text=f"❌ Top up rejected.\nIf this is wrong, message admin: {ADMIN_USERNAME}"
+        set_state(context, "ADMIN_DELETE_PRODUCT", {})
+        await q.message.reply_text("🗑️ Send product_id to delete (example: `3`)", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "noop":
+        await q.message.reply_text("Coming soon.")
+        return
+
+# ---------- Text menu handler ----------
+
+async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    user = update.effective_user
+
+    if text == "/start":
+        await start(update, context); return
+    if text == "/menu":
+        await menu(update, context); return
+
+    if text == "📦 List Produk":
+        await list_produk(update, context); return
+    if text == "💰 Balance":
+        await balance(update, context); return
+    if text == "➕ Add Balance":
+        await add_balance_entry(update, context); return
+    if text == "💬 Chat Admin":
+        await chat_admin(update, context); return
+    if text == "❌ Cancel":
+        await cancel(update, context); return
+    if text == "🛠️ Admin Panel":
+        await admin_panel(update, context); return
+
+    # If admin is in a state flow, handle below
+    state, payload = get_state(context)
+    if state:
+        await handle_state(update, context, state, payload)
+        return
+
+    # default
+    await update.message.reply_text("Type /start or use the buttons.")
+
+# ---------- Photo handler ----------
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.upsert_user(user.id, user.username)
+
+    # Admin QR setting state?
+    state, payload = get_state(context)
+    if state == "ADMIN_SET_QR" and is_admin(user):
+        which = payload.get("which")
+        file_id = update.message.photo[-1].file_id
+        caption = update.message.caption or ""
+
+        if which == "gcash_qr":
+            db.set_setting("gcash_qr_file_id", file_id)
+            if caption.strip():
+                db.set_setting("gcash_caption", caption)
+            set_state(context, "")
+            await update.message.reply_text("✅ GCash QR saved! (caption saved if provided)")
+            return
+        if which == "gotyme_qr":
+            db.set_setting("gotyme_qr_file_id", file_id)
+            if caption.strip():
+                db.set_setting("gotyme_caption", caption)
+            set_state(context, "")
+            await update.message.reply_text("✅ GoTyme QR saved! (caption saved if provided)")
+            return
+
+    # Customer payment proof:
+    proof_file_id = update.message.photo[-1].file_id
+
+    topup_db_id = db.attach_topup_proof(user.id, proof_file_id)
+    if not topup_db_id:
+        await update.message.reply_text("❌ No pending topup found. Please click ➕ Add Balance first.")
+        return
+
+    t = db.get_topup_by_dbid(topup_db_id)
+    admin_username = ADMIN_USERNAMES[0] if ADMIN_USERNAMES else "lovebylunaa"
+
+    # reply to customer
+    await update.message.reply_text(
+        f"✅ Proof received!\nTopup ID: {t['topup_id']}\nAmount: {money(t['amount'])}\n"
+        f"⏳ Waiting for admin approval.\nAdmin: @{admin_username}"
+    )
+
+    # notify admin(s) with approve buttons
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"topupapprove:{t['topup_db_id']}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"topupreject:{t['topup_db_id']}")
+        ]
+    ])
+    admin_msg = (
+        f"🧾 *TOPUP PROOF RECEIVED*\n"
+        f"Topup ID: *{t['topup_id']}*\n"
+        f"User: `{t['user_id']}` (@{user.username or 'no_username'})\n"
+        f"Amount: *{money(t['amount'])}*\n"
+        f"Method: *{t['method']}*\n"
+    )
+
+    for admin_u in ADMIN_USERNAMES:
+        # we cannot DM by username directly without chat_id; simplest: send to same chat if admin is using bot.
+        # So: send to admin who last interacted via "pending_topups"? Not stored.
+        # We'll still show inside /pending list, and approve buttons work there too.
+        pass
+
+    # If you want admin instant DM notifications, you must add ADMIN_CHAT_ID in env (recommended)
+    admin_chat_id = os.getenv("ADMIN_CHAT_ID", "").strip()
+    if admin_chat_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=int(admin_chat_id),
+                photo=proof_file_id,
+                caption=admin_msg,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb
+            )
+        except Exception as e:
+            log.warning("Failed to send admin DM: %s", e)
+
+# ---------- Handle admin text states ----------
+async def handle_state(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, payload: dict):
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+
+    if not is_admin(user):
+        context.user_data.clear()
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if state == "ADMIN_SET_TEXT":
+        key = payload.get("key")
+        if not key:
+            context.user_data.clear()
+            await update.message.reply_text("❌ Missing key.")
+            return
+        db.set_setting(key, text)
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ Updated `{key}`.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if state == "ADMIN_ANNOUNCE":
+        # broadcast to all users
+        prefix = db.get_setting("announcement_prefix")
+        msg = prefix + text
+        users = db.list_users()
+        sent = 0
+        failed = 0
+        for u in users:
+            try:
+                await context.bot.send_message(chat_id=u["user_id"], text=msg, parse_mode=ParseMode.MARKDOWN)
+                sent += 1
+            except Exception:
+                failed += 1
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ Announcement sent.\nSent: {sent}\nFailed: {failed}")
+        return
+
+    if state == "ADMIN_ADD_PRODUCT":
+        # name | price | stock | description
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 3:
+            await update.message.reply_text("❌ Format wrong. Use: `name | price | stock | description`", parse_mode=ParseMode.MARKDOWN)
+            return
+        name = parts[0]
+        try:
+            price = int(parts[1])
+            stock = int(parts[2])
+        except:
+            await update.message.reply_text("❌ Price/stock must be numbers.")
+            return
+        description = parts[3] if len(parts) >= 4 else ""
+        pid = db.create_product(name, description, price, stock, None)
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ Product added. ID = {pid}\n(Optional) To attach delivery file, send it later and we can add a button for that.)")
+        return
+
+    if state == "ADMIN_EDIT_PRODUCT_ID":
+        try:
+            pid = int(text)
+        except:
+            await update.message.reply_text("❌ Send a number product_id.")
+            return
+        p = db.get_product(pid)
+        if not p:
+            await update.message.reply_text("❌ Product not found.")
+            return
+        set_state(context, "ADMIN_EDIT_PRODUCT_FIELDS", {"pid": pid})
+        await update.message.reply_text(
+            f"Editing product {pid}:\n"
+            f"Current: {p['name']} | {money(p['price'])} | stock {p['stock']}\n\n"
+            f"Send like:\n`name | price | stock | description`\n(you can keep same values too)",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-# ================== ADMIN: PENDING LIST ==================
+    if state == "ADMIN_EDIT_PRODUCT_FIELDS":
+        pid = payload.get("pid")
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 3:
+            await update.message.reply_text("❌ Format wrong. Use: `name | price | stock | description`", parse_mode=ParseMode.MARKDOWN)
+            return
+        name = parts[0]
+        try:
+            price = int(parts[1])
+            stock = int(parts[2])
+        except:
+            await update.message.reply_text("❌ Price/stock must be numbers.")
+            return
+        description = parts[3] if len(parts) >= 4 else ""
+        db.update_product(pid, name=name, price=price, stock=stock, description=description)
+        context.user_data.clear()
+        await update.message.reply_text("✅ Product updated.")
+        return
+
+    if state == "ADMIN_DELETE_PRODUCT":
+        try:
+            pid = int(text)
+        except:
+            await update.message.reply_text("❌ Send a number product_id.")
+            return
+        p = db.get_product(pid)
+        if not p:
+            await update.message.reply_text("❌ Product not found.")
+            return
+        db.delete_product(pid)
+        context.user_data.clear()
+        await update.message.reply_text("✅ Product deleted.")
+        return
+
+    # fallback
+    context.user_data.clear()
+    await update.message.reply_text("✅ Done.")
+
+# ---------- Commands to help admin ----------
 async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user = update.effective_user
+    if not is_admin(user):
+        await update.message.reply_text("❌ Admin only.")
         return
-    pending = list_pending_topups(30)
+    pending = db.list_pending_topups(limit=50)
     if not pending:
         await update.message.reply_text("✅ No pending topups.")
         return
-
-    lines = ["🧾 Pending Topups:"]
-    for tid, uid, proof in pending:
-        code = get_setting(f"TOPUP:{tid}:CODE") or f"TOPUP-{tid}"
-        amt = get_setting(f"TOPUP:{tid}:AMOUNT") or "?"
-        method = get_setting(f"TOPUP:{tid}:METHOD") or "?"
-        lines.append(f"- {code} | user:{uid} | {money(int(amt))} | {method}")
-
-    await update.message.reply_text("\n".join(lines))
-
-# ================== ADMIN: SET QR ==================
-async def setqrgcash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    context.user_data["awaiting_qr"] = "GCASH"
-    await update.message.reply_text("✅ Send your GCash QR as PHOTO now.")
-
-async def setqrgoytme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    context.user_data["awaiting_qr"] = "GOTYME"
-    await update.message.reply_text("✅ Send your GoTyme QR as PHOTO now.")
-
-async def setqrcaption_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /setqrcaption gcash|gotyme <caption text>")
-        return
-    which = context.args[0].lower()
-    text = " ".join(context.args[1:]).strip()
-    if which == "gcash":
-        set_setting("PAYMENT_QR_GCASH_CAPTION", text)
-        await update.message.reply_text("✅ GCash caption saved.")
-    elif which == "gotyme":
-        set_setting("PAYMENT_QR_GOTYME_CAPTION", text)
-        await update.message.reply_text("✅ GoTyme caption saved.")
-    else:
-        await update.message.reply_text("First arg must be gcash or gotyme.")
-
-# ================== ONE PHOTO HANDLER (FIX) ==================
-async def on_any_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    This fixes your issue:
-    - if admin is setting QR -> save QR
-    - else if user is awaiting proof -> treat as payment proof
-    - else ignore
-    """
-    user_id = update.effective_user.id
-
-    # 1) Admin QR upload
-    which = context.user_data.get("awaiting_qr")
-    if which and is_admin(user_id):
-        if not update.message.photo:
-            await update.message.reply_text("❌ Please send as PHOTO.")
-            return
-        file_id = update.message.photo[-1].file_id
-        if which == "GCASH":
-            set_setting("PAYMENT_QR_GCASH_FILE_ID", file_id)
-            await update.message.reply_text("✅ GCash QR saved!")
-        else:
-            set_setting("PAYMENT_QR_GOTYME_FILE_ID", file_id)
-            await update.message.reply_text("✅ GoTyme QR saved!")
-        context.user_data["awaiting_qr"] = None
-        return
-
-    # 2) Customer proof upload
-    topup_id = context.user_data.get("awaiting_proof")
-    if topup_id:
-        proof_file_id = update.message.photo[-1].file_id if update.message.photo else None
-        if not proof_file_id:
-            await update.message.reply_text("❌ Please send screenshot as PHOTO.")
-            return
-
-        row = get_topup_row(int(topup_id))
-        if not row:
-            await update.message.reply_text("Topup not found. Please create new top up.")
-            context.user_data["awaiting_proof"] = None
-            return
-
-        _id, owner_id, status, _old = row
-        if int(owner_id) != int(user_id):
-            await update.message.reply_text("This topup is not yours.")
-            return
-        if status != "PENDING":
-            await update.message.reply_text(f"Topup already {status}.")
-            context.user_data["awaiting_proof"] = None
-            return
-
-        set_topup_proof(int(topup_id), proof_file_id)
-
-        code = get_setting(f"TOPUP:{topup_id}:CODE") or f"TOPUP-{topup_id}"
-        amount = int(get_setting(f"TOPUP:{topup_id}:AMOUNT") or "0")
-        method = get_setting(f"TOPUP:{topup_id}:METHOD") or "UNKNOWN"
-
-        # ✅ Customer follow-up message
-        await update.message.reply_text(
-            "✅ Thank you! Proof of payment received.\n"
-            f"🧾 Topup ID: {code}\n"
-            f"💵 Amount: {money(amount)}\n"
-            f"💳 Method: {method}\n\n"
-            "⏳ Waiting for admin approval.\n"
-            f"⚡ For faster approval, DM admin: {ADMIN_USERNAME}"
+    for t in pending:
+        uname = t.get("username") or "(no username)"
+        msg = (
+            f"🧾 *PENDING TOPUP*\n"
+            f"Topup ID: *{t['topup_id']}*\n"
+            f"User: `{t['user_id']}` (@{uname})\n"
+            f"Amount: *{money(t['amount'])}*\n"
+            f"Method: *{t['method']}*\n"
         )
-
-        # ✅ Notify admins with buttons + screenshot
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{topup_id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject:{topup_id}"),
+                InlineKeyboardButton("✅ Approve", callback_data=f"topupapprove:{t['topup_db_id']}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"topupreject:{t['topup_db_id']}")
             ]
         ])
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        "🧾 New Topup Proof Received\n"
-                        f"Topup ID: {code}\n"
-                        f"User ID: {user_id}\n"
-                        f"Amount: {money(amount)}\n"
-                        f"Method: {method}\n"
-                    ),
-                    reply_markup=kb
-                )
-                await context.bot.send_photo(chat_id=admin_id, photo=proof_file_id)
-            except Exception as e:
-                print("Admin notify failed:", e)
-
-        context.user_data["awaiting_proof"] = None
-        return
-
-    # 3) Otherwise ignore
-    return
-
-# ================== TEXT MENU ==================
-async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-
-    if text == "💰 Balance":
-        await show_balance(update, context)
-        return
-
-    if text == "➕ Add Balance":
-        await add_balance_menu(update, context)
-        return
-
-    if text == "💬 Chat Admin":
-        await update.message.reply_text(f"Message admin: {ADMIN_USERNAME}")
-        return
-
-    if text == "❌ Cancel":
-        context.user_data.pop("awaiting_proof", None)
-        context.user_data.pop("awaiting_qr", None)
-        context.user_data.pop("topup_amount", None)
-        await update.message.reply_text("✅ Cancelled.", reply_markup=main_menu_kb())
-        return
-
-    if text == "📦 List Produk":
-        await update.message.reply_text("Products part not added in this file version yet.")
-        return
-
-    await update.message.reply_text("Please choose a button, or type /start.", reply_markup=main_menu_kb())
-
-# ================== MAIN ==================
+# ---------- Main ----------
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+    db.init_db()
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN is missing.")
+
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-
-    # Admin QR + captions + pending
-    app.add_handler(CommandHandler("setqrgcash", setqrgcash_cmd))
-    app.add_handler(CommandHandler("setqrgoytme", setqrgoytme_cmd))
-    app.add_handler(CommandHandler("setqrgotyme", setqrgoytme_cmd))  # alias
-    app.add_handler(CommandHandler("setqrcaption", setqrcaption_cmd))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("pending", pending_cmd))
 
-    # Inline button callbacks
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # ✅ One photo handler fixes your "no reply after sending proof"
-    app.add_handler(MessageHandler(filters.PHOTO, on_any_photo))
+    # Photos: QR set + payment proof
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
     # Text menu
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_menu))
 
+    log.info("Bot running...")
     app.run_polling()
 
 if __name__ == "__main__":
