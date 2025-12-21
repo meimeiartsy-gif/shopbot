@@ -94,6 +94,17 @@ def ensure_schema():
         admin_id BIGINT
     );
 
+    CREATE TABLE IF NOT EXISTS variants (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  price INTEGER NOT NULL DEFAULT 0,
+  stock INTEGER NOT NULL DEFAULT 0,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+    CREATE INDEX IF NOT EXISTS idx_variants_product ON variants(product_id);    
     CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
     CREATE INDEX IF NOT EXISTS idx_variants_product ON variants(product_id);
     CREATE INDEX IF NOT EXISTS idx_stock_variant_sold ON stock_items(variant_id, is_sold);
