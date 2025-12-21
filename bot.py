@@ -913,6 +913,35 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # --- IMPORTANT: Admin text router must run FIRST ---
+    # This prevents other text handlers from blocking the admin steps.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_router),
+        group=-1
+    )
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+
+    # Menu
+    app.add_handler(MessageHandler(filters.Regex(r"^🛍 Shop$"), shop))
+    app.add_handler(MessageHandler(filters.Regex(r"^💳 Add Balance$"), add_balance))
+    app.add_handler(MessageHandler(filters.Regex(r"^💰 Balance$"), balance))
+    app.add_handler(MessageHandler(filters.Regex(r"^📜 History$"), history))
+    app.add_handler(MessageHandler(filters.Regex(r"^🆘 Help$"), help_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔐 Admin$"), admin_cmd))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(cb_payment, pattern=r"^pay:"))
+    app.add_handler(CallbackQueryHandler(cb_amount, pattern=r"^amt:"))
+    app.add_handler(CallbackQueryHandler(cb_shop, pattern=r"^shop:"))
+    app.add_handler(CallbackQueryHandler(cb_buy, pattern=r"^buy:"))
+    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin:"))
+
+    # Photos (user proof + admin thumbnail)
+    app.add_handler(MessageHandler(filters.PHOTO, proof_photo))
+    app.add_handler(MessageHandler(filters.PHOTO, admin_photo_router))
+
     # commands
     app.add_handler(CommandHandler("start", start))
 
