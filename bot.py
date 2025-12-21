@@ -19,7 +19,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-ADMIN_IDS = {123456789}  # 🔁 PUT YOUR REAL TELEGRAM USER ID HERE
+ADMIN_IDS = {7719956917}  # 🔁 PUT YOUR REAL TELEGRAM USER ID HERE
 
 def db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
