@@ -1,869 +1,906 @@
 import os
 import uuid
 import logging
+
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-from db import ensure_schema, fetch_all, fetch_one, exec_sql, db
+from db import ensure_schema, db, fetch_all, fetch_one, exec_sql
+from utils import (
+    parse_int_money,
+    send_clean_menu,
+    delete_last_menu,
+    push_screen,
+    pop_screen,
+    peek_screen,
+)
+
+from payments import payment_method_menu, topup_amount_menu, send_payment_qr
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("premshop")
+log = logging.getLogger("shopbot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
 
-GCASH_QR_FILE_ID = os.getenv("GCASH_QR_FILE_ID", "").strip()
-GOTYME_QR_FILE_ID = os.getenv("GOTYME_QR_FILE_ID", "").strip()
-
-PAYMENT_TEXT_GCASH = os.getenv(
-    "PAYMENT_TEXT_GCASH",
-    "📌 *GCash Instructions*\n\n1) Scan the QR\n2) Pay\n3) Send screenshot here"
-).strip()
-
-PAYMENT_TEXT_GOTYME = os.getenv(
-    "PAYMENT_TEXT_GOTYME",
-    "📌 *GoTyme Instructions*\n\n1) Scan the QR\n2) Pay\n3) Send screenshot here"
-).strip()
+ADMIN_IDS = {7719956917}  # <-- your admin id
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["🛍 Shop", "💳 Add Balance"],
         ["💰 Balance", "📜 History"],
-        ["🆘 Help", "🔐 Admin"]
+        ["🆘 Help", "🔐 Admin"],
     ],
     resize_keyboard=True
 )
 
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 def fmt_money(n: int) -> str:
     return f"₱{n:,}"
 
-# ---------- BACK STACK ----------
-def push_state(context, state: str):
-    stack = context.user_data.get("nav_stack", [])
-    stack.append(state)
-    context.user_data["nav_stack"] = stack
-
-def pop_state(context):
-    stack = context.user_data.get("nav_stack", [])
-    if stack:
-        stack.pop()
-    context.user_data["nav_stack"] = stack
-    return stack[-1] if stack else ""
-
-async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    prev = pop_state(context)
-    if not prev:
-        await q.message.reply_text("Back to menu ✅", reply_markup=MAIN_MENU)
-        return
-    await render_state(q, context, prev)
-
-async def render_state(q, context, state: str):
-    if state == "cats":
-        await show_categories(q, context, push=False); return
-    if state.startswith("cat:"):
-        await show_products(q, context, int(state.split(":")[1]), push=False); return
-    if state.startswith("prod:"):
-        await show_product(q, context, int(state.split(":")[1]), push=False); return
-    if state.startswith("checkout:"):
-        _, vid, qty = state.split(":")
-        await show_checkout(q, context, int(vid), int(qty), push=False); return
+async def safe_answer(q):
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
 # =========================
-# START / BASIC
+# START
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    exec_sql("INSERT INTO users(user_id) VALUES(%s) ON CONFLICT (user_id) DO NOTHING", (uid,))
+    user = update.effective_user
+    exec_sql("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;", (user.id,))
     context.user_data["nav_stack"] = []
-    await update.message.reply_text(
-        "Welcome to **Luna’s Prem Shop** 💗",
+    await send_clean_menu(
+        update, context,
+        "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:",
         reply_markup=MAIN_MENU,
         parse_mode=ParseMode.MARKDOWN
     )
 
+# =========================
+# BASIC MENU
+# =========================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await send_clean_menu(
+        update, context,
         "🆘 **Help**\n\n"
-        "• Tap **Shop** to browse/buy\n"
-        "• Tap **Add Balance** to top-up\n"
-        "• Send proof screenshot after payment\n\n"
-        "If you need help, contact admin 💗",
+        "• Tap **Shop** to browse and buy\n"
+        "• Tap **Add Balance** to top up\n"
+        "• After you send proof, wait for approval\n",
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    row = fetch_one("SELECT balance FROM users WHERE user_id=%s", (uid,))
+    user_id = update.effective_user.id
+    row = fetch_one("SELECT COALESCE(balance,0) AS balance FROM users WHERE user_id=%s", (user_id,))
     bal = int(row["balance"]) if row else 0
-    await update.message.reply_text(f"💰 Your balance: **{fmt_money(bal)}**", parse_mode=ParseMode.MARKDOWN)
+    await send_clean_menu(update, context, f"💰 Your balance: **{fmt_money(bal)}**", parse_mode=ParseMode.MARKDOWN)
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    user_id = update.effective_user.id
     rows = fetch_all("""
-        SELECT oi.id, p.name AS product_name, v.name AS variant_name, oi.qty, oi.unit_price, oi.delivered
-        FROM order_items oi
-        JOIN variants v ON v.id=oi.variant_id
-        JOIN products p ON p.id=oi.product_id
-        JOIN orders o ON o.id=oi.order_id
-        WHERE o.user_id=%s
-        ORDER BY oi.id DESC
+        SELECT p.created_at, v.name as variant_name, p.qty, p.total_price, p.delivered
+        FROM purchases p
+        JOIN variants v ON v.id = p.variant_id
+        WHERE p.user_id=%s
+        ORDER BY p.created_at DESC
         LIMIT 15
-    """, (uid,))
+    """, (user_id,))
     if not rows:
-        await update.message.reply_text("📜 No orders yet.")
+        await send_clean_menu(update, context, "📜 No purchases yet.")
         return
-    lines = ["📜 **Recent Orders**\n"]
+
+    lines = ["📜 **Recent Purchases**\n"]
     for r in rows:
-        st = "✅ delivered" if r["delivered"] else "⏳ pending"
-        lines.append(f"• {r['product_name']} ({r['variant_name']}) x{r['qty']} — {fmt_money(int(r['unit_price']))} — {st}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        status = "✅ delivered" if r["delivered"] else "⏳ pending"
+        lines.append(f"• {r['variant_name']} x{r['qty']} — {fmt_money(int(r['total_price']))} — {status}")
+    await send_clean_menu(update, context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 # =========================
-# TOP-UP FLOW
+# TOP-UP
 # =========================
 async def add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("💙 GCash", callback_data="pay:gcash")],
-        [InlineKeyboardButton("💜 GoTyme", callback_data="pay:gotyme")],
-    ]
-    await update.message.reply_text("💳 Choose payment method:", reply_markup=InlineKeyboardMarkup(kb))
+    push_screen(context, "main")
+    await send_clean_menu(
+        update, context,
+        "💳 **Add Balance**\n\nChoose payment method:",
+        reply_markup=payment_method_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def cb_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
+
+    if q.data == "pay:back":
+        await send_clean_menu(update, context, "Back ✅", reply_markup=MAIN_MENU)
+        return
+
     method = q.data.split(":", 1)[1]
     context.user_data["topup_method"] = method
 
-    if method == "gcash":
-        file_id = GCASH_QR_FILE_ID
-        text = PAYMENT_TEXT_GCASH
-    else:
-        file_id = GOTYME_QR_FILE_ID
-        text = PAYMENT_TEXT_GOTYME
+    # QR
+    await send_payment_qr(update, context, method)
 
-    if file_id:
-        await q.message.reply_photo(photo=file_id, caption=text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await q.message.reply_text(text + "\n\n⚠️ QR not set in Railway variables.", parse_mode=ParseMode.MARKDOWN)
+    # Amounts
+    await send_clean_menu(
+        update, context,
+        "✨ Choose top-up amount:",
+        reply_markup=topup_amount_menu(),
+    )
 
-    rows = [
-        [InlineKeyboardButton("₱50", callback_data="amt:50"), InlineKeyboardButton("₱100", callback_data="amt:100")],
-        [InlineKeyboardButton("₱300", callback_data="amt:300"), InlineKeyboardButton("₱500", callback_data="amt:500")],
-        [InlineKeyboardButton("₱1000", callback_data="amt:1000")],
-    ]
-    await q.message.reply_text("✨ Choose top-up amount:", reply_markup=InlineKeyboardMarkup(rows))
-
-async def cb_amt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
+
     if "topup_method" not in context.user_data:
-        await q.message.reply_text("Please choose method again.")
+        await send_clean_menu(update, context, "Tap **Add Balance** again and choose method first.", parse_mode=ParseMode.MARKDOWN)
         return
 
     amount = int(q.data.split(":", 1)[1])
     method = context.user_data["topup_method"]
+
     topup_id = f"shopnluna:{uuid.uuid4().hex[:10]}"
     context.user_data["topup_id"] = topup_id
 
-    exec_sql("""
-        INSERT INTO topups(topup_id,user_id,amount,method,status)
-        VALUES(%s,%s,%s,%s,'PENDING')
-    """, (topup_id, q.from_user.id, amount, method))
+    exec_sql(
+        """INSERT INTO topups (topup_id, user_id, amount, method, status)
+           VALUES (%s,%s,%s,%s,'PENDING');""",
+        (topup_id, q.from_user.id, amount, method)
+    )
 
-    await q.message.reply_text(
+    await send_clean_menu(
+        update, context,
         f"🆔 **Top-up ID:** `{topup_id}`\n"
-        f"Amount: **{fmt_money(amount)}**\n"
-        f"Method: **{method.upper()}**\n\n"
+        f"💵 Amount: **{fmt_money(amount)}**\n"
+        f"💳 Method: **{method.upper()}**\n\n"
         "📸 Now send your **payment screenshot** here.\n"
-        "⏳ Waiting for admin approval.",
+        "⏳ Status: **Waiting for approval**",
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def proof_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "topup_id" not in context.user_data:
         return
+
     topup_id = context.user_data["topup_id"]
+    user_id = update.effective_user.id
     file_id = update.message.photo[-1].file_id
+
     exec_sql("UPDATE topups SET proof_file_id=%s WHERE topup_id=%s", (file_id, topup_id))
 
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"admin:topup:approve:{topup_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"admin:topup:reject:{topup_id}")
-        ]
-    ])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"admin:topup:approve:{topup_id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"admin:topup:reject:{topup_id}"),
+    ]])
 
-    for aid in ADMIN_IDS:
+    for admin_id in ADMIN_IDS:
         await context.bot.send_photo(
-            chat_id=aid,
+            chat_id=admin_id,
             photo=file_id,
-            caption=f"💳 **New Top-up Proof**\nTopup: `{topup_id}`\nUser: `{update.effective_user.id}`",
+            caption=(
+                "💳 **New Top-up Proof**\n\n"
+                f"Topup ID: `{topup_id}`\n"
+                f"User ID: `{user_id}`\n\n"
+                "Choose an action:"
+            ),
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN
         )
 
-    await update.message.reply_text("✅ Proof received. Waiting for admin approval 💗")
+    await send_clean_menu(update, context, "✅ Proof received.\n⏳ Waiting for admin approval.\n\nThank you 💗")
 
 # =========================
-# SHOP
+# SHOP (Customer)
 # =========================
 async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    qmsg = update.message
-    cats = fetch_all("SELECT id,name FROM categories ORDER BY id ASC")
+    cats = fetch_all("SELECT id, name FROM categories ORDER BY id ASC")
     rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-    await qmsg.reply_text("🛍 **Categories**", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="shop:back")])
 
-async def show_categories(q, context, push=True):
-    if push: push_state(context, "cats")
-    cats = fetch_all("SELECT id,name FROM categories ORDER BY id ASC")
-    rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-    await q.message.reply_text("🛍 **Categories**", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
-
-async def show_products(q, context, cat_id: int, push=True):
-    if push: push_state(context, f"cat:{cat_id}")
-    prods = fetch_all("""
-        SELECT p.id,p.name,
-               (SELECT COUNT(*) FROM variants v WHERE v.product_id=p.id AND v.is_active=TRUE) AS vcount
-        FROM products p
-        WHERE p.is_active=TRUE AND p.category_id=%s
-        ORDER BY p.id ASC
-    """, (cat_id,))
-    if not prods:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="nav:back")]])
-        await q.message.reply_text("No products here yet 💗", reply_markup=kb)
-        return
-    rows = [[InlineKeyboardButton(f"{p['name']} ({p['vcount']} variants)", callback_data=f"shop:prod:{p['id']}")] for p in prods]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="nav:back")])
-    await q.message.reply_text("Select a product:", reply_markup=InlineKeyboardMarkup(rows))
-
-async def show_product(q, context, prod_id: int, push=True):
-    if push: push_state(context, f"prod:{prod_id}")
-    prod = fetch_one("SELECT * FROM products WHERE id=%s AND is_active=TRUE", (prod_id,))
-    if not prod:
-        await q.message.reply_text("Product not found.")
-        return
-
-    variants = fetch_all("""
-        SELECT v.id,v.name,v.price,
-               (SELECT COUNT(*) FROM stocks s WHERE s.variant_id=v.id AND s.is_sold=FALSE) AS stock_left
-        FROM variants v
-        WHERE v.product_id=%s AND v.is_active=TRUE
-        ORDER BY v.id ASC
-    """, (prod_id,))
-
-    lines = [f"🧾 **{prod['name']}**", "", prod["description"] or "", "", "Choose a variant:"]
-    kb_rows = []
-    for v in variants:
-        kb_rows.append([
-            InlineKeyboardButton(
-                f"{v['name']} — {fmt_money(int(v['price']))} | stock:{int(v['stock_left'])}",
-                callback_data=f"shop:var:{v['id']}"
-            )
-        ])
-    kb_rows.append([InlineKeyboardButton("⬅️ Back", callback_data="nav:back")])
-    kb = InlineKeyboardMarkup(kb_rows)
-
-    if prod.get("thumbnail_file_id"):
-        try:
-            await q.message.reply_photo(photo=prod["thumbnail_file_id"], caption="\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-            return
-        except Exception:
-            pass
-    await q.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-
-async def show_checkout(q, context, variant_id: int, qty: int, push=True):
-    if push: push_state(context, f"checkout:{variant_id}:{qty}")
-    v = fetch_one("""
-        SELECT v.id,v.name,v.price,
-               p.name AS product_name,
-               (SELECT COUNT(*) FROM stocks s WHERE s.variant_id=v.id AND s.is_sold=FALSE) AS stock_left
-        FROM variants v
-        JOIN products p ON p.id=v.product_id
-        WHERE v.id=%s AND v.is_active=TRUE
-    """, (variant_id,))
-    if not v:
-        await q.message.reply_text("Variant not found.")
-        return
-
-    total = int(v["price"]) * qty
-    stock_left = int(v["stock_left"])
-    if qty > stock_left:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="nav:back")]])
-        await q.message.reply_text(f"❌ Not enough stock.\nAvailable: {stock_left}", reply_markup=kb)
-        return
-
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("➖", callback_data=f"qty:dec:{variant_id}:{qty}"),
-            InlineKeyboardButton(f"Qty: {qty}", callback_data="noop"),
-            InlineKeyboardButton("➕", callback_data=f"qty:inc:{variant_id}:{qty}")
-        ],
-        [
-            InlineKeyboardButton("✅ Confirm", callback_data=f"buy:confirm:{variant_id}:{qty}"),
-            InlineKeyboardButton("❌ Cancel", callback_data="buy:cancel")
-        ],
-        [InlineKeyboardButton("⬅️ Back", callback_data="nav:back")]
-    ])
-
-    await q.message.reply_text(
-        f"🛒 **Checkout**\n\n"
-        f"Product: **{v['product_name']}**\n"
-        f"Variant: **{v['name']}**\n"
-        f"Unit: **{fmt_money(int(v['price']))}**\n"
-        f"Qty: **{qty}**\n"
-        f"Total: **{fmt_money(total)}**\n\n"
-        f"Stock left: **{stock_left}**",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb
-    )
+    push_screen(context, "main")
+    await send_clean_menu(update, context, "🛍 **Shop Categories**", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
 
 async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    data = q.data
+    await safe_answer(q)
 
-    if data == "noop":
+    if q.data == "shop:back":
+        await send_clean_menu(update, context, "Back ✅", reply_markup=MAIN_MENU)
         return
 
-    if data.startswith("shop:cat:"):
-        cat_id = int(data.split(":")[2])
-        push_state(context, "cats")
-        await show_products(q, context, cat_id, push=True)
+    parts = q.data.split(":")
+    if parts[1] == "cat":
+        cat_id = int(parts[2])
+        products = fetch_all("""
+            SELECT id, name FROM products
+            WHERE is_active=TRUE AND category_id=%s
+            ORDER BY id ASC
+        """, (cat_id,))
+        if not products:
+            await send_clean_menu(update, context, "No products in this category yet 💗")
+            return
+
+        rows = [[InlineKeyboardButton(f"#{i+1} {p['name']}", callback_data=f"shop:prod:{p['id']}")]
+                for i, p in enumerate(products)]
+        rows.append([InlineKeyboardButton("⬅️ Categories", callback_data="shop:cats")])
+        await send_clean_menu(update, context, "Choose product:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if data.startswith("shop:prod:"):
-        prod_id = int(data.split(":")[2])
-        await show_product(q, context, prod_id, push=True)
+    if parts[1] == "cats":
+        await shop_from_callback(update, context)
         return
 
-    if data.startswith("shop:var:"):
-        variant_id = int(data.split(":")[2])
-        await show_checkout(q, context, variant_id, 1, push=True)
+    if parts[1] == "prod":
+        prod_id = int(parts[2])
+        prod = fetch_one("SELECT id,name,description FROM products WHERE id=%s AND is_active=TRUE", (prod_id,))
+        if not prod:
+            await send_clean_menu(update, context, "Product not found.")
+            return
+
+        variants = fetch_all("""
+            SELECT v.id, v.name, v.price,
+                   (SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.is_sold=FALSE) AS stock
+            FROM variants v
+            WHERE v.product_id=%s AND v.is_active=TRUE
+            ORDER BY v.id ASC
+        """, (prod_id,))
+
+        if not variants:
+            await send_clean_menu(update, context, "No variants yet for this product.")
+            return
+
+        rows = [[InlineKeyboardButton(
+            f"#{i+1} {v['name']} — {fmt_money(int(v['price']))} (stock {v['stock']})",
+            callback_data=f"buy:variant:{v['id']}"
+        )] for i, v in enumerate(variants)]
+
+        rows.append([InlineKeyboardButton("⬅️ Products", callback_data=f"shop:cat:{prod['id']}")])
+        rows.append([InlineKeyboardButton("⬅️ Categories", callback_data="shop:cats")])
+
+        await send_clean_menu(
+            update, context,
+            f"🧾 **{prod['name']}**\n\n{prod['description']}\n\nChoose variant:",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-async def cb_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, action, variant_id, qty = q.data.split(":")
-    variant_id = int(variant_id)
-    qty = int(qty)
-    qty = qty + 1 if action == "inc" else max(1, qty - 1)
-    await show_checkout(q, context, variant_id, qty, push=True)
-
-async def cb_buy_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    pop_state(context)      # checkout
-    prev = pop_state(context)  # back
-    if not prev:
-        await q.message.reply_text("Cancelled ✅", reply_markup=MAIN_MENU)
-        return
-    await render_state(q, context, prev)
-
-async def cb_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, _, variant_id, qty = q.data.split(":")
-    variant_id = int(variant_id)
-    qty = int(qty)
-    user_id = q.from_user.id
-
-    v = fetch_one("""
-        SELECT v.id,v.name,v.price,p.id AS product_id,p.name AS product_name
-        FROM variants v JOIN products p ON p.id=v.product_id
-        WHERE v.id=%s AND v.is_active=TRUE
-    """, (variant_id,))
-    if not v:
-        await q.message.reply_text("Variant not found.")
-        return
-
-    unit_price = int(v["price"])
-    total = unit_price * qty
-
-    stock_payloads = []
-    order_item_id = None
-
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO users(user_id) VALUES(%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-            cur.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (user_id,))
-            bal = int(cur.fetchone()[0])
-            if bal < total:
-                conn.rollback()
-                await q.message.reply_text(f"❌ Not enough balance.\nBalance: {fmt_money(bal)}\nTotal: {fmt_money(total)}")
-                return
-
-            cur.execute("""
-                SELECT id,payload FROM stocks
-                WHERE variant_id=%s AND is_sold=FALSE
-                ORDER BY id ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT %s
-            """, (variant_id, qty))
-            rows = cur.fetchall()
-            if len(rows) < qty:
-                conn.rollback()
-                await q.message.reply_text("❌ Not enough stock. Try again later.")
-                return
-
-            stock_ids = []
-            for sid, payload in rows:
-                stock_ids.append(sid)
-                stock_payloads.append(payload)
-
-            cur.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (total, user_id))
-
-            order_token = f"ord:{uuid.uuid4().hex}"
-            cur.execute("INSERT INTO orders(order_token,user_id,total,status) VALUES(%s,%s,%s,'PAID') RETURNING id",
-                        (order_token, user_id, total))
-            order_id = cur.fetchone()[0]
-
-            cur.execute("""
-                INSERT INTO order_items(order_id,product_id,variant_id,qty,unit_price,delivered)
-                VALUES(%s,%s,%s,%s,%s,FALSE) RETURNING id
-            """, (order_id, v["product_id"], variant_id, qty, unit_price))
-            order_item_id = cur.fetchone()[0]
-
-            cur.execute("""
-                UPDATE stocks
-                SET is_sold=TRUE, sold_at=NOW(), sold_to=%s, order_item_id=%s
-                WHERE id = ANY(%s)
-            """, (user_id, order_item_id, stock_ids))
-
-            conn.commit()
-
-    delivered_text = "\n".join(stock_payloads)
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=(
-            f"📦 **Auto Delivery**\n\n"
-            f"Product: **{v['product_name']}**\n"
-            f"Variant: **{v['name']}**\n"
-            f"Qty: **{qty}**\n\n"
-            f"✅ Here are your items:\n\n"
-            f"```{delivered_text}```\n\n"
-            "Keep it safe 💗"
-        ),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    exec_sql("UPDATE order_items SET delivered=TRUE, delivered_at=NOW() WHERE id=%s", (order_item_id,))
-    await q.message.reply_text("✅ Order confirmed & delivered 💗")
+async def shop_from_callback(update, context):
+    cats = fetch_all("SELECT id, name FROM categories ORDER BY id ASC")
+    rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="shop:back")])
+    await send_clean_menu(update, context, "🛍 **Shop Categories**", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
 
 # =========================
-# ADMIN PANEL (FULL)
+# BUY FLOW (variant -> qty -> confirm)
 # =========================
-ADMIN_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("➕ Add Product", callback_data="admin:addprod")],
-    [InlineKeyboardButton("✏️ Edit/Delete Product", callback_data="admin:manageprod")],
-    [InlineKeyboardButton("➕ Add Variant", callback_data="admin:addvar")],
-    [InlineKeyboardButton("✏️ Edit/Delete Variant", callback_data="admin:managevar")],
-    [InlineKeyboardButton("➕ Add Stock", callback_data="admin:addstock")],
-    [InlineKeyboardButton("🖼 Set Thumbnail", callback_data="admin:setthumb")],
-    [InlineKeyboardButton("⏳ Pending Top-ups", callback_data="admin:pendingtopups")],
-])
+async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
+
+    parts = q.data.split(":")
+    if parts[0] != "buy":
+        return
+
+    if parts[1] == "variant":
+        variant_id = int(parts[2])
+        v = fetch_one("""
+            SELECT v.id, v.name, v.price, v.thumbnail_file_id, p.name AS product_name
+            FROM variants v JOIN products p ON p.id=v.product_id
+            WHERE v.id=%s AND v.is_active=TRUE
+        """, (variant_id,))
+        if not v:
+            await send_clean_menu(update, context, "Variant not found.")
+            return
+
+        stock = fetch_one("SELECT COUNT(*) AS c FROM stock_items WHERE variant_id=%s AND is_sold=FALSE", (variant_id,))
+        stock_count = int(stock["c"]) if stock else 0
+
+        context.user_data["buy_variant_id"] = variant_id
+        context.user_data["buy_unit_price"] = int(v["price"])
+
+        # qty buttons
+        qty_rows = [
+            [InlineKeyboardButton("1", callback_data="buy:qty:1"),
+             InlineKeyboardButton("2", callback_data="buy:qty:2"),
+             InlineKeyboardButton("3", callback_data="buy:qty:3")],
+            [InlineKeyboardButton("5", callback_data="buy:qty:5"),
+             InlineKeyboardButton("10", callback_data="buy:qty:10")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="buy:back_to_variants")],
+        ]
+
+        text = (
+            f"✅ **{v['product_name']}**\n"
+            f"• Variant: **{v['name']}**\n"
+            f"• Price: **{fmt_money(int(v['price']))}**\n"
+            f"• Stock: **{stock_count}**\n\n"
+            "Choose quantity:"
+        )
+
+        # show thumbnail if available
+        if v.get("thumbnail_file_id"):
+            try:
+                await delete_last_menu(context, q.message.chat_id)
+                msg = await q.message.reply_photo(
+                    photo=v["thumbnail_file_id"],
+                    caption=text,
+                    reply_markup=InlineKeyboardMarkup(qty_rows),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                context.user_data["last_menu_msg_id"] = msg.message_id
+                return
+            except Exception:
+                pass
+
+        await send_clean_menu(update, context, text, reply_markup=InlineKeyboardMarkup(qty_rows), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if parts[1] == "qty":
+        qty = int(parts[2])
+        variant_id = context.user_data.get("buy_variant_id")
+        unit_price = context.user_data.get("buy_unit_price")
+        if not variant_id or not unit_price:
+            await send_clean_menu(update, context, "Please choose a variant again.")
+            return
+
+        # check stock
+        stock = fetch_one("SELECT COUNT(*) AS c FROM stock_items WHERE variant_id=%s AND is_sold=FALSE", (variant_id,))
+        stock_count = int(stock["c"]) if stock else 0
+        if qty > stock_count:
+            await send_clean_menu(update, context, f"❌ Not enough stock.\nAvailable: {stock_count}")
+            return
+
+        total = qty * unit_price
+        context.user_data["buy_qty"] = qty
+        context.user_data["buy_total"] = total
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm Order", callback_data="buy:confirm")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="buy:cancel")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="buy:back_to_qty")],
+        ])
+
+        await send_clean_menu(
+            update, context,
+            f"🧾 **Confirm Order**\n\nQty: **{qty}**\nTotal: **{fmt_money(total)}**\n\nProceed?",
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if parts[1] == "cancel":
+        context.user_data.pop("buy_variant_id", None)
+        context.user_data.pop("buy_unit_price", None)
+        context.user_data.pop("buy_qty", None)
+        context.user_data.pop("buy_total", None)
+        await send_clean_menu(update, context, "Cancelled ✅", reply_markup=MAIN_MENU)
+        return
+
+    if parts[1] == "confirm":
+        user_id = q.from_user.id
+        variant_id = context.user_data.get("buy_variant_id")
+        qty = int(context.user_data.get("buy_qty", 0))
+        unit_price = int(context.user_data.get("buy_unit_price", 0))
+        total = int(context.user_data.get("buy_total", 0))
+
+        if not variant_id or qty <= 0 or total <= 0:
+            await send_clean_menu(update, context, "Please try again.")
+            return
+
+        purchase_token = f"pur:{uuid.uuid4().hex[:12]}"
+
+        # atomic: check balance + reserve stock + deduct balance
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO users(user_id) VALUES(%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+                cur.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (user_id,))
+                bal = int(cur.fetchone()[0])
+
+                if bal < total:
+                    conn.rollback()
+                    await send_clean_menu(update, context, f"❌ Not enough balance.\nBalance: {fmt_money(bal)}\nNeed: {fmt_money(total)}")
+                    return
+
+                # reserve stock rows (first available)
+                cur.execute("""
+                    SELECT id, payload
+                    FROM stock_items
+                    WHERE variant_id=%s AND is_sold=FALSE
+                    ORDER BY id ASC
+                    LIMIT %s
+                    FOR UPDATE
+                """, (variant_id, qty))
+                rows = cur.fetchall()
+
+                if len(rows) < qty:
+                    conn.rollback()
+                    await send_clean_menu(update, context, "❌ Stock changed. Not enough stock now. Please try again.")
+                    return
+
+                # deduct balance
+                cur.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (total, user_id))
+
+                # create purchase
+                cur.execute("""
+                    INSERT INTO purchases(purchase_token,user_id,variant_id,qty,unit_price,total_price,delivered)
+                    VALUES(%s,%s,%s,%s,%s,%s,FALSE)
+                """, (purchase_token, user_id, variant_id, qty, unit_price, total))
+
+                # mark stock sold
+                stock_ids = [r[0] for r in rows]
+                cur.execute("""
+                    UPDATE stock_items
+                    SET is_sold=TRUE, sold_at=NOW(), purchase_token=%s
+                    WHERE id = ANY(%s)
+                """, (purchase_token, stock_ids))
+
+                conn.commit()
+
+        # deliver
+        lines = [r[1] for r in rows]
+        deliver_text = "\n".join(lines)
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ **Order Delivered**\nToken: `{purchase_token}`\n\n{deliver_text}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        exec_sql("UPDATE purchases SET delivered=TRUE, delivered_at=NOW() WHERE purchase_token=%s", (purchase_token,))
+
+        # cleanup
+        context.user_data.pop("buy_variant_id", None)
+        context.user_data.pop("buy_unit_price", None)
+        context.user_data.pop("buy_qty", None)
+        context.user_data.pop("buy_total", None)
+
+        await send_clean_menu(update, context, "✅ Purchase complete! 💗", reply_markup=MAIN_MENU)
+        return
+
+# =========================
+# ADMIN
+# =========================
+def admin_panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧩 Manage Products", callback_data="admin:products")],
+        [InlineKeyboardButton("🧷 Manage Variants", callback_data="admin:variants")],
+        [InlineKeyboardButton("📦 Add Stock", callback_data="admin:stock")],
+        [InlineKeyboardButton("🖼 Set Thumbnail", callback_data="admin:thumb")],
+        [InlineKeyboardButton("⏳ Pending Topups", callback_data="admin:topups")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")],
+    ])
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Access denied.")
+        await send_clean_menu(update, context, "❌ Access denied.")
         return
-    await update.message.reply_text("🔐 **Admin Panel**", reply_markup=ADMIN_MENU, parse_mode=ParseMode.MARKDOWN)
-
-def admin_only(uid: int) -> bool:
-    return is_admin(uid)
+    await send_clean_menu(update, context, "🔐 **Admin Panel**", reply_markup=admin_panel_kb(), parse_mode=ParseMode.MARKDOWN)
 
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    if not admin_only(q.from_user.id):
-        await q.message.reply_text("❌ Access denied.")
+    await safe_answer(q)
+
+    if not is_admin(q.from_user.id):
+        await send_clean_menu(update, context, "❌ Access denied.")
         return
 
     data = q.data
 
-    # --- Topup approve/reject ---
-    if data.startswith("admin:topup:"):
-        _, _, action, topup_id = data.split(":", 3)
-        await admin_decide_topup(q, context, action, topup_id)
+    if data == "admin:back":
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("admin_step", None)
+        await send_clean_menu(update, context, "Back ✅", reply_markup=MAIN_MENU)
         return
 
-    # --- Pending topups list ---
-    if data == "admin:pendingtopups":
+    # TOPUP approve/reject
+    if data.startswith("admin:topup:"):
+        _, _, action, topup_id = data.split(":", 3)
+        await admin_decide_topup(update, context, action, topup_id)
+        return
+
+    if data == "admin:topups":
         rows = fetch_all("""
-            SELECT topup_id,user_id,amount,method,created_at,proof_file_id
+            SELECT topup_id,user_id,amount,method,created_at
             FROM topups WHERE status='PENDING'
             ORDER BY created_at DESC LIMIT 10
         """)
         if not rows:
-            await q.message.reply_text("✅ No pending top-ups.")
+            await send_clean_menu(update, context, "✅ No pending top-ups.")
             return
-
+        lines = ["⏳ **Pending Top-ups**\n"]
         for r in rows:
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Approve", callback_data=f"admin:topup:approve:{r['topup_id']}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"admin:topup:reject:{r['topup_id']}")
-                ]
-            ])
-            txt = (
-                f"💳 **Pending Top-up**\n"
-                f"ID: `{r['topup_id']}`\n"
-                f"User: `{r['user_id']}`\n"
-                f"Amount: **{fmt_money(int(r['amount']))}**\n"
-                f"Method: **{r['method']}**"
-            )
-            if r.get("proof_file_id"):
-                await q.message.reply_photo(photo=r["proof_file_id"], caption=txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-            else:
-                await q.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            lines.append(f"• `{r['topup_id']}` — user `{r['user_id']}` — {fmt_money(int(r['amount']))} — {r['method']}")
+        await send_clean_menu(update, context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         return
 
-    # --- Add Product ---
-    if data == "admin:addprod":
-        cats = fetch_all("SELECT id,name FROM categories ORDER BY id ASC")
-        kb = [[InlineKeyboardButton(c["name"], callback_data=f"admin:addprod:cat:{c['id']}")] for c in cats]
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-        await q.message.reply_text("Choose category:", reply_markup=InlineKeyboardMarkup(kb))
+    # ===== Manage Products =====
+    if data == "admin:products":
+        cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
+        kb = [[InlineKeyboardButton(c["name"], callback_data=f"admin:products:cat:{c['id']}")] for c in cats]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")])
+        await send_clean_menu(update, context, "Choose category:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if data.startswith("admin:addprod:cat:"):
-        cat_id = int(data.split(":")[3])
-        context.user_data["admin_addprod_cat"] = cat_id
-        context.user_data["admin_mode"] = "addprod_name"
-        await q.message.reply_text("Send product name now:")
+    if data == "admin:panel":
+        await send_clean_menu(update, context, "🔐 **Admin Panel**", reply_markup=admin_panel_kb(), parse_mode=ParseMode.MARKDOWN)
         return
 
-    # --- Manage products (list) ---
-    if data == "admin:manageprod":
-        prods = fetch_all("SELECT id,name FROM products ORDER BY id DESC LIMIT 30")
-        if not prods:
-            await q.message.reply_text("No products yet.")
-            return
-        kb = [[InlineKeyboardButton(f"#{p['id']} {p['name']}", callback_data=f"admin:prod:{p['id']}")] for p in prods]
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-        await q.message.reply_text("Select product to manage:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("admin:prod:"):
-        prod_id = int(data.split(":")[2])
-        prod = fetch_one("SELECT * FROM products WHERE id=%s", (prod_id,))
-        if not prod:
-            await q.message.reply_text("Not found.")
-            return
+    if data.startswith("admin:products:cat:"):
+        cat_id = int(data.split(":")[-1])
+        context.user_data["admin_cat_id"] = cat_id
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Edit Name", callback_data=f"admin:prodedit:name:{prod_id}")],
-            [InlineKeyboardButton("✏️ Edit Description", callback_data=f"admin:prodedit:desc:{prod_id}")],
-            [InlineKeyboardButton("✅ Toggle Active", callback_data=f"admin:prodedit:toggle:{prod_id}")],
-            [InlineKeyboardButton("🗑 Delete Product", callback_data=f"admin:proddelete:{prod_id}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="admin:manageprod")],
+            [InlineKeyboardButton("➕ Add Product", callback_data="admin:products:add")],
+            [InlineKeyboardButton("✏️ Edit/Delete Product", callback_data="admin:products:list")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:products")],
         ])
-        await q.message.reply_text(
-            f"🧾 **Product #{prod_id}**\nName: {prod['name']}\nActive: {prod['is_active']}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb
-        )
+        await send_clean_menu(update, context, "Product actions:", reply_markup=kb)
         return
 
-    if data.startswith("admin:prodedit:toggle:"):
-        prod_id = int(data.split(":")[3])
-        exec_sql("UPDATE products SET is_active = NOT is_active WHERE id=%s", (prod_id,))
-        await q.message.reply_text("✅ Updated active status.")
+    if data == "admin:products:add":
+        context.user_data["admin_mode"] = "add_product"
+        context.user_data["admin_step"] = "name"
+        await send_clean_menu(update, context, "Send product name now:")
         return
 
-    if data.startswith("admin:proddelete:"):
-        prod_id = int(data.split(":")[2])
+    if data == "admin:products:list":
+        cat_id = int(context.user_data.get("admin_cat_id", 0))
+        prods = fetch_all("SELECT id,name FROM products WHERE category_id=%s ORDER BY id", (cat_id,))
+        if not prods:
+            await send_clean_menu(update, context, "No products yet.")
+            return
+        kb = [[InlineKeyboardButton(f"#{i+1} {p['name']}", callback_data=f"admin:products:edit:{p['id']}")] for i,p in enumerate(prods)]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data=f"admin:products:cat:{cat_id}")])
+        await send_clean_menu(update, context, "Choose product:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data.startswith("admin:products:edit:"):
+        prod_id = int(data.split(":")[-1])
+        context.user_data["admin_prod_id"] = prod_id
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Edit Name", callback_data="admin:products:editname")],
+            [InlineKeyboardButton("✏️ Edit Description", callback_data="admin:products:editdesc")],
+            [InlineKeyboardButton("🗑 Delete Product", callback_data="admin:products:delete")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:products:list")],
+        ])
+        await send_clean_menu(update, context, "Edit product:", reply_markup=kb)
+        return
+
+    if data == "admin:products:editname":
+        context.user_data["admin_mode"] = "edit_product_name"
+        context.user_data["admin_step"] = "text"
+        await send_clean_menu(update, context, "Send new product name:")
+        return
+
+    if data == "admin:products:editdesc":
+        context.user_data["admin_mode"] = "edit_product_desc"
+        context.user_data["admin_step"] = "text"
+        await send_clean_menu(update, context, "Send new product description:")
+        return
+
+    if data == "admin:products:delete":
+        prod_id = int(context.user_data.get("admin_prod_id", 0))
         exec_sql("DELETE FROM products WHERE id=%s", (prod_id,))
-        await q.message.reply_text("🗑 Deleted product.")
+        await send_clean_menu(update, context, "✅ Product deleted.", reply_markup=admin_panel_kb())
         return
 
-    if data.startswith("admin:prodedit:name:"):
-        prod_id = int(data.split(":")[3])
-        context.user_data["admin_mode"] = "edit_prod_name"
-        context.user_data["admin_target_id"] = prod_id
-        await q.message.reply_text("Send the NEW product name:")
+    # ===== Manage Variants =====
+    if data == "admin:variants":
+        # choose product first
+        cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
+        kb = [[InlineKeyboardButton(c["name"], callback_data=f"admin:variants:cat:{c['id']}")] for c in cats]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")])
+        await send_clean_menu(update, context, "Choose category:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if data.startswith("admin:prodedit:desc:"):
-        prod_id = int(data.split(":")[3])
-        context.user_data["admin_mode"] = "edit_prod_desc"
-        context.user_data["admin_target_id"] = prod_id
-        await q.message.reply_text("Send the NEW product description:")
-        return
-
-    # --- Add Variant ---
-    if data == "admin:addvar":
-        prods = fetch_all("SELECT id,name FROM products ORDER BY id DESC LIMIT 30")
-        kb = [[InlineKeyboardButton(f"#{p['id']} {p['name']}", callback_data=f"admin:addvar:prod:{p['id']}")] for p in prods]
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-        await q.message.reply_text("Choose product for variant:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("admin:addvar:prod:"):
-        prod_id = int(data.split(":")[3])
-        context.user_data["admin_addvar_prod"] = prod_id
-        context.user_data["admin_mode"] = "addvar_name"
-        await q.message.reply_text("Send variant name now (example: 1 Month / 3 Months):")
-        return
-
-    # --- Manage Variants ---
-    if data == "admin:managevar":
-        vars_ = fetch_all("""
-            SELECT v.id, p.name AS product_name, v.name, v.price, v.is_active
-            FROM variants v JOIN products p ON p.id=v.product_id
-            ORDER BY v.id DESC LIMIT 30
-        """)
-        if not vars_:
-            await q.message.reply_text("No variants yet.")
-            return
-        kb = [[InlineKeyboardButton(f"#{v['id']} {v['product_name']} - {v['name']}", callback_data=f"admin:var:{v['id']}")] for v in vars_]
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-        await q.message.reply_text("Select variant to manage:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("admin:var:"):
-        vid = int(data.split(":")[2])
-        v = fetch_one("""
-            SELECT v.*, p.name AS product_name
-            FROM variants v JOIN products p ON p.id=v.product_id
-            WHERE v.id=%s
-        """, (vid,))
-        if not v:
-            await q.message.reply_text("Not found.")
-            return
-        stock_left = fetch_one("SELECT COUNT(*) AS c FROM stocks WHERE variant_id=%s AND is_sold=FALSE", (vid,))["c"]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Edit Name", callback_data=f"admin:varedit:name:{vid}")],
-            [InlineKeyboardButton("✏️ Edit Price", callback_data=f"admin:varedit:price:{vid}")],
-            [InlineKeyboardButton("✅ Toggle Active", callback_data=f"admin:varedit:toggle:{vid}")],
-            [InlineKeyboardButton("🗑 Delete Variant", callback_data=f"admin:vardelete:{vid}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="admin:managevar")],
-        ])
-        await q.message.reply_text(
-            f"📦 **Variant #{vid}**\n"
-            f"Product: {v['product_name']}\n"
-            f"Name: {v['name']}\n"
-            f"Price: {fmt_money(int(v['price']))}\n"
-            f"Stock left: {stock_left}\n"
-            f"Active: {v['is_active']}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb
-        )
-        return
-
-    if data.startswith("admin:varedit:toggle:"):
-        vid = int(data.split(":")[3])
-        exec_sql("UPDATE variants SET is_active = NOT is_active WHERE id=%s", (vid,))
-        await q.message.reply_text("✅ Updated variant active.")
-        return
-
-    if data.startswith("admin:vardelete:"):
-        vid = int(data.split(":")[2])
-        exec_sql("DELETE FROM variants WHERE id=%s", (vid,))
-        await q.message.reply_text("🗑 Deleted variant.")
-        return
-
-    if data.startswith("admin:varedit:name:"):
-        vid = int(data.split(":")[3])
-        context.user_data["admin_mode"] = "edit_var_name"
-        context.user_data["admin_target_id"] = vid
-        await q.message.reply_text("Send NEW variant name:")
-        return
-
-    if data.startswith("admin:varedit:price:"):
-        vid = int(data.split(":")[3])
-        context.user_data["admin_mode"] = "edit_var_price"
-        context.user_data["admin_target_id"] = vid
-        await q.message.reply_text("Send NEW price (number only):")
-        return
-
-    # --- Add Stock ---
-    if data == "admin:addstock":
-        vars_ = fetch_all("""
-            SELECT v.id, p.name AS product_name, v.name
-            FROM variants v JOIN products p ON p.id=v.product_id
-            ORDER BY v.id DESC LIMIT 30
-        """)
-        if not vars_:
-            await q.message.reply_text("No variants yet.")
-            return
-        kb = [[InlineKeyboardButton(f"#{v['id']} {v['product_name']} - {v['name']}", callback_data=f"admin:addstock:var:{v['id']}")] for v in vars_]
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-        await q.message.reply_text("Choose variant to add stock:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("admin:addstock:var:"):
-        vid = int(data.split(":")[3])
-        context.user_data["admin_mode"] = "add_stock_lines"
-        context.user_data["admin_target_id"] = vid
-        await q.message.reply_text(
-            "Paste your stock now (ONE PER LINE).\n\nExample:\nemail1:pass1\nemail2:pass2\nemail3:pass3"
-        )
-        return
-
-    # --- Set thumbnail ---
-    if data == "admin:setthumb":
-        prods = fetch_all("SELECT id,name FROM products ORDER BY id DESC LIMIT 30")
+    if data.startswith("admin:variants:cat:"):
+        cat_id = int(data.split(":")[-1])
+        prods = fetch_all("SELECT id,name FROM products WHERE category_id=%s ORDER BY id", (cat_id,))
         if not prods:
-            await q.message.reply_text("No products yet.")
+            await send_clean_menu(update, context, "No products yet in this category.")
             return
-        kb = [[InlineKeyboardButton(f"#{p['id']} {p['name']}", callback_data=f"admin:setthumb:prod:{p['id']}")] for p in prods]
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-        await q.message.reply_text("Choose product to set thumbnail:", reply_markup=InlineKeyboardMarkup(kb))
+        kb = [[InlineKeyboardButton(f"#{i+1} {p['name']}", callback_data=f"admin:variants:prod:{p['id']}")] for i,p in enumerate(prods)]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:variants")])
+        await send_clean_menu(update, context, "Choose product for variant:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if data.startswith("admin:setthumb:prod:"):
-        prod_id = int(data.split(":")[3])
-        context.user_data["admin_mode"] = "set_thumb_wait_photo"
-        context.user_data["admin_target_id"] = prod_id
-        await q.message.reply_text("Send the thumbnail PHOTO now.")
+    if data.startswith("admin:variants:prod:"):
+        prod_id = int(data.split(":")[-1])
+        context.user_data["admin_prod_id"] = prod_id
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Variant", callback_data="admin:variant:add")],
+            [InlineKeyboardButton("✏️ Edit/Delete Variant", callback_data="admin:variant:list")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:variants")],
+        ])
+        await send_clean_menu(update, context, "Variant actions:", reply_markup=kb)
         return
 
-    if data == "admin:back":
-        await q.message.reply_text("Back ✅", reply_markup=ADMIN_MENU)
+    if data == "admin:variant:add":
+        context.user_data["admin_mode"] = "add_variant"
+        context.user_data["admin_step"] = "name"
+        await send_clean_menu(update, context, "Send variant name now (example: 1 Month / 3 Months):")
         return
 
-async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if data == "admin:variant:list":
+        prod_id = int(context.user_data.get("admin_prod_id", 0))
+        vars_ = fetch_all("SELECT id,name,price FROM variants WHERE product_id=%s ORDER BY id", (prod_id,))
+        if not vars_:
+            await send_clean_menu(update, context, "No variants yet.")
+            return
+        kb = [[InlineKeyboardButton(f"#{i+1} {v['name']} — {fmt_money(int(v['price']))}", callback_data=f"admin:variant:edit:{v['id']}")]
+              for i,v in enumerate(vars_)]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data=f"admin:variants:prod:{prod_id}")])
+        await send_clean_menu(update, context, "Choose variant:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data.startswith("admin:variant:edit:"):
+        vid = int(data.split(":")[-1])
+        context.user_data["admin_variant_id"] = vid
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Edit Name", callback_data="admin:variant:editname")],
+            [InlineKeyboardButton("💸 Edit Price", callback_data="admin:variant:editprice")],
+            [InlineKeyboardButton("🗑 Delete Variant", callback_data="admin:variant:delete")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:variant:list")],
+        ])
+        await send_clean_menu(update, context, "Edit variant:", reply_markup=kb)
+        return
+
+    if data == "admin:variant:editname":
+        context.user_data["admin_mode"] = "edit_variant_name"
+        context.user_data["admin_step"] = "text"
+        await send_clean_menu(update, context, "Send new variant name:")
+        return
+
+    if data == "admin:variant:editprice":
+        context.user_data["admin_mode"] = "edit_variant_price"
+        context.user_data["admin_step"] = "price"
+        await send_clean_menu(update, context, "Send variant price (number only):")
+        return
+
+    if data == "admin:variant:delete":
+        vid = int(context.user_data.get("admin_variant_id", 0))
+        exec_sql("DELETE FROM variants WHERE id=%s", (vid,))
+        await send_clean_menu(update, context, "✅ Variant deleted.", reply_markup=admin_panel_kb())
+        return
+
+    # ===== Add Stock =====
+    if data == "admin:stock":
+        # pick variant first
+        vars_ = fetch_all("""
+            SELECT v.id, p.name as product_name, v.name, v.price
+            FROM variants v JOIN products p ON p.id=v.product_id
+            WHERE v.is_active=TRUE
+            ORDER BY p.id, v.id
+            LIMIT 50
+        """)
+        if not vars_:
+            await send_clean_menu(update, context, "No variants found.")
+            return
+
+        kb = [[InlineKeyboardButton(f"#{i+1} {r['product_name']} / {r['name']}", callback_data=f"admin:stock:pick:{r['id']}")]
+              for i,r in enumerate(vars_)]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")])
+        await send_clean_menu(update, context, "Choose variant to add stock:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data.startswith("admin:stock:pick:"):
+        vid = int(data.split(":")[-1])
+        context.user_data["admin_variant_id"] = vid
+        context.user_data["admin_mode"] = "add_stock"
+        context.user_data["admin_step"] = "stock_text"
+        await send_clean_menu(
+            update, context,
+            "Send stock lines now.\n\nExample:\nemail1:pass1\nemail2:pass2\n\n(Each line = 1 stock item)"
+        )
+        return
+
+    # ===== Set Thumbnail =====
+    if data == "admin:thumb":
+        vars_ = fetch_all("""
+            SELECT v.id, p.name as product_name, v.name
+            FROM variants v JOIN products p ON p.id=v.product_id
+            WHERE v.is_active=TRUE
+            ORDER BY p.id, v.id
+            LIMIT 50
+        """)
+        if not vars_:
+            await send_clean_menu(update, context, "No variants found.")
+            return
+
+        kb = [[InlineKeyboardButton(f"#{i+1} {r['product_name']} / {r['name']}", callback_data=f"admin:thumb:pick:{r['id']}")]
+              for i,r in enumerate(vars_)]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")])
+        await send_clean_menu(update, context, "Choose variant to set thumbnail:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data.startswith("admin:thumb:pick:"):
+        vid = int(data.split(":")[-1])
+        context.user_data["admin_variant_id"] = vid
+        context.user_data["admin_mode"] = "set_thumb"
+        context.user_data["admin_step"] = "photo"
+        await send_clean_menu(update, context, "Now send the thumbnail image (photo):")
+        return
+
+async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles admin text steps (add/edit product/variant, add stock)
+    """
     if not is_admin(update.effective_user.id):
         return
+
     mode = context.user_data.get("admin_mode")
-    if not mode:
+    step = context.user_data.get("admin_step")
+    if not mode or not step:
         return
 
     text = (update.message.text or "").strip()
 
-    if mode == "addprod_name":
-        context.user_data["admin_addprod_name"] = text
-        context.user_data["admin_mode"] = "addprod_desc"
-        await update.message.reply_text("Send product description now:")
-        return
-
-    if mode == "addprod_desc":
-        cat_id = context.user_data.get("admin_addprod_cat")
-        name = context.user_data.get("admin_addprod_name", "")
-        desc = text
-        exec_sql("INSERT INTO products(category_id,name,description,is_active) VALUES(%s,%s,%s,TRUE)", (cat_id, name, desc))
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text("✅ Product added!")
-        return
-
-    if mode == "edit_prod_name":
-        prod_id = context.user_data["admin_target_id"]
-        exec_sql("UPDATE products SET name=%s WHERE id=%s", (text, prod_id))
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text("✅ Product name updated.")
-        return
-
-    if mode == "edit_prod_desc":
-        prod_id = context.user_data["admin_target_id"]
-        exec_sql("UPDATE products SET description=%s WHERE id=%s", (text, prod_id))
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text("✅ Product description updated.")
-        return
-
-    if mode == "addvar_name":
-        context.user_data["admin_addvar_name"] = text
-        context.user_data["admin_mode"] = "addvar_price"
-        await update.message.reply_text("Send variant price (number only):")
-        return
-
-    if mode == "addvar_price":
-        prod_id = context.user_data["admin_addvar_prod"]
-        vname = context.user_data.get("admin_addvar_name", "")
-        try:
-            price = int(text)
-        except:
-            await update.message.reply_text("Send price as number only.")
+    # ADD PRODUCT
+    if mode == "add_product":
+        if step == "name":
+            context.user_data["tmp_product_name"] = text
+            context.user_data["admin_step"] = "desc"
+            await send_clean_menu(update, context, "Send product description now:")
             return
-        exec_sql("INSERT INTO variants(product_id,name,price,is_active) VALUES(%s,%s,%s,TRUE)", (prod_id, vname, price))
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text("✅ Variant added!")
+        if step == "desc":
+            cat_id = int(context.user_data.get("admin_cat_id", 0))
+            name = context.user_data.get("tmp_product_name", "Product")
+            desc = text
+            exec_sql("INSERT INTO products(category_id,name,description,is_active) VALUES(%s,%s,%s,TRUE)", (cat_id, name, desc))
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("admin_step", None)
+            context.user_data.pop("tmp_product_name", None)
+            await send_clean_menu(update, context, "✅ Product added!", reply_markup=admin_panel_kb())
+            return
+
+    # EDIT PRODUCT NAME/DESC
+    if mode == "edit_product_name":
+        prod_id = int(context.user_data.get("admin_prod_id", 0))
+        exec_sql("UPDATE products SET name=%s WHERE id=%s", (text, prod_id))
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("admin_step", None)
+        await send_clean_menu(update, context, "✅ Updated product name.", reply_markup=admin_panel_kb())
         return
 
-    if mode == "edit_var_name":
-        vid = context.user_data["admin_target_id"]
+    if mode == "edit_product_desc":
+        prod_id = int(context.user_data.get("admin_prod_id", 0))
+        exec_sql("UPDATE products SET description=%s WHERE id=%s", (text, prod_id))
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("admin_step", None)
+        await send_clean_menu(update, context, "✅ Updated product description.", reply_markup=admin_panel_kb())
+        return
+
+    # ADD VARIANT
+    if mode == "add_variant":
+        if step == "name":
+            context.user_data["tmp_variant_name"] = text
+            context.user_data["admin_step"] = "price"
+            await send_clean_menu(update, context, "Send variant price (number only):")
+            return
+
+        if step == "price":
+            price = parse_int_money(text)
+            if price < 0:
+                await send_clean_menu(update, context, "Send price as number only. Example: 8")
+                return
+
+            prod_id = int(context.user_data.get("admin_prod_id", 0))
+            vname = context.user_data.get("tmp_variant_name", "Variant")
+            exec_sql("INSERT INTO variants(product_id,name,price,is_active) VALUES(%s,%s,%s,TRUE)", (prod_id, vname, price))
+
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("admin_step", None)
+            context.user_data.pop("tmp_variant_name", None)
+            await send_clean_menu(update, context, f"✅ Variant added! Price: {fmt_money(price)}", reply_markup=admin_panel_kb())
+            return
+
+    # EDIT VARIANT NAME
+    if mode == "edit_variant_name":
+        vid = int(context.user_data.get("admin_variant_id", 0))
         exec_sql("UPDATE variants SET name=%s WHERE id=%s", (text, vid))
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text("✅ Variant name updated.")
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("admin_step", None)
+        await send_clean_menu(update, context, "✅ Updated variant name.", reply_markup=admin_panel_kb())
         return
 
-    if mode == "edit_var_price":
-        vid = context.user_data["admin_target_id"]
-        try:
-            price = int(text)
-        except:
-            await update.message.reply_text("Send price as number only.")
+    # EDIT VARIANT PRICE
+    if mode == "edit_variant_price":
+        vid = int(context.user_data.get("admin_variant_id", 0))
+        price = parse_int_money(text)
+        if price < 0:
+            await send_clean_menu(update, context, "Send price as number only. Example: 8")
             return
         exec_sql("UPDATE variants SET price=%s WHERE id=%s", (price, vid))
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text("✅ Variant price updated.")
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("admin_step", None)
+        await send_clean_menu(update, context, f"✅ Updated price to {fmt_money(price)}", reply_markup=admin_panel_kb())
         return
 
-    if mode == "add_stock_lines":
-        vid = context.user_data["admin_target_id"]
+    # ADD STOCK (bulk lines)
+    if mode == "add_stock":
+        vid = int(context.user_data.get("admin_variant_id", 0))
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if not lines:
-            await update.message.reply_text("No lines found. Paste again.")
+            await send_clean_menu(update, context, "Send stock lines. Each line = 1 item.")
             return
+
         with db() as conn:
             with conn.cursor() as cur:
                 for ln in lines:
-                    cur.execute("INSERT INTO stocks(variant_id,payload,is_sold) VALUES(%s,%s,FALSE)", (vid, ln))
-            conn.commit()
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text(f"✅ Added {len(lines)} stock lines to variant #{vid}.")
+                    cur.execute("INSERT INTO stock_items(variant_id,payload,is_sold) VALUES(%s,%s,FALSE)", (vid, ln))
+                conn.commit()
+
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("admin_step", None)
+        await send_clean_menu(update, context, f"✅ Added {len(lines)} stock item(s).", reply_markup=admin_panel_kb())
         return
 
-async def admin_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles admin photo step for thumbnails
+    """
     if not is_admin(update.effective_user.id):
         return
-    mode = context.user_data.get("admin_mode")
-    if mode != "set_thumb_wait_photo":
-        return
-    prod_id = context.user_data["admin_target_id"]
-    file_id = update.message.photo[-1].file_id
-    exec_sql("UPDATE products SET thumbnail_file_id=%s WHERE id=%s", (file_id, prod_id))
-    context.user_data["admin_mode"] = None
-    await update.message.reply_text("✅ Thumbnail saved!")
 
-async def admin_decide_topup(q, context, action: str, topup_id: str):
+    mode = context.user_data.get("admin_mode")
+    step = context.user_data.get("admin_step")
+    if mode != "set_thumb" or step != "photo":
+        return
+
+    vid = int(context.user_data.get("admin_variant_id", 0))
+    file_id = update.message.photo[-1].file_id
+    exec_sql("UPDATE variants SET thumbnail_file_id=%s WHERE id=%s", (file_id, vid))
+
+    context.user_data.pop("admin_mode", None)
+    context.user_data.pop("admin_step", None)
+    await send_clean_menu(update, context, "✅ Thumbnail set!", reply_markup=admin_panel_kb())
+
+async def admin_decide_topup(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, topup_id: str):
+    q = update.callback_query
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id,amount,status FROM topups WHERE topup_id=%s FOR UPDATE", (topup_id,))
+            cur.execute("SELECT user_id, amount, status FROM topups WHERE topup_id=%s FOR UPDATE", (topup_id,))
             row = cur.fetchone()
             if not row:
                 conn.rollback()
-                await q.message.reply_text("Topup not found.")
+                await send_clean_menu(update, context, "Top-up not found.")
                 return
-            user_id, amount, status = row
+
+            user_id, amount, status = int(row[0]), int(row[1]), row[2]
             if status != "PENDING":
                 conn.rollback()
-                await q.message.reply_text("Already decided.")
+                await send_clean_menu(update, context, f"Already decided: {status}")
                 return
+
             if action == "approve":
-                cur.execute("UPDATE topups SET status='APPROVED', decided_at=NOW(), admin_id=%s WHERE topup_id=%s",
-                            (q.from_user.id, topup_id))
+                cur.execute("UPDATE topups SET status='APPROVED', decided_at=NOW(), admin_id=%s WHERE topup_id=%s", (q.from_user.id, topup_id))
                 cur.execute("INSERT INTO users(user_id) VALUES(%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
                 cur.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, user_id))
                 conn.commit()
-                await context.bot.send_message(chat_id=user_id, text=f"✅ Topup approved: {fmt_money(amount)}\nYour balance updated 💗")
-                await q.message.reply_text("✅ Approved.")
+                await context.bot.send_message(chat_id=user_id, text=f"✅ Top-up approved! Amount: {fmt_money(amount)}")
+                await send_clean_menu(update, context, "✅ Approved.", reply_markup=admin_panel_kb())
                 return
+
             if action == "reject":
-                cur.execute("UPDATE topups SET status='REJECTED', decided_at=NOW(), admin_id=%s WHERE topup_id=%s",
-                            (q.from_user.id, topup_id))
+                cur.execute("UPDATE topups SET status='REJECTED', decided_at=NOW(), admin_id=%s WHERE topup_id=%s", (q.from_user.id, topup_id))
                 conn.commit()
-                await context.bot.send_message(chat_id=user_id, text="❌ Topup rejected. Contact admin if mistake.")
-                await q.message.reply_text("❌ Rejected.")
+                await context.bot.send_message(chat_id=user_id, text="❌ Top-up rejected. Contact admin if mistake.")
+                await send_clean_menu(update, context, "❌ Rejected.", reply_markup=admin_panel_kb())
                 return
 
 # =========================
@@ -871,16 +908,15 @@ async def admin_decide_topup(q, context, action: str, topup_id: str):
 # =========================
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing.")
-    if not ADMIN_IDS:
-        raise RuntimeError("ADMIN_IDS missing in Railway Variables (example: 7719956917).")
-
+        raise RuntimeError("BOT_TOKEN is missing. Set it in Railway Variables.")
     ensure_schema()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # commands
     app.add_handler(CommandHandler("start", start))
 
+    # main menu
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Shop$"), shop))
     app.add_handler(MessageHandler(filters.Regex(r"^💳 Add Balance$"), add_balance))
     app.add_handler(MessageHandler(filters.Regex(r"^💰 Balance$"), balance))
@@ -888,20 +924,19 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^🆘 Help$"), help_cmd))
     app.add_handler(MessageHandler(filters.Regex(r"^🔐 Admin$"), admin_cmd))
 
-    app.add_handler(CallbackQueryHandler(go_back, pattern=r"^nav:back$"))
-    app.add_handler(CallbackQueryHandler(cb_pay, pattern=r"^pay:"))
-    app.add_handler(CallbackQueryHandler(cb_amt, pattern=r"^amt:"))
+    # callbacks (IMPORTANT: patterns must match callback_data prefixes)
+    app.add_handler(CallbackQueryHandler(cb_payment, pattern=r"^pay:"))
+    app.add_handler(CallbackQueryHandler(cb_amount, pattern=r"^amt:"))
     app.add_handler(CallbackQueryHandler(cb_shop, pattern=r"^shop:"))
-    app.add_handler(CallbackQueryHandler(cb_qty, pattern=r"^qty:"))
-    app.add_handler(CallbackQueryHandler(cb_buy_confirm, pattern=r"^buy:confirm:"))
-    app.add_handler(CallbackQueryHandler(cb_buy_cancel, pattern=r"^buy:cancel$"))
+    app.add_handler(CallbackQueryHandler(cb_buy, pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin:"))
 
-    app.add_handler(MessageHandler(filters.PHOTO, proof_photo))
+    # photos
+    app.add_handler(MessageHandler(filters.PHOTO, proof_photo))          # user topup proof
+    app.add_handler(MessageHandler(filters.PHOTO, admin_photo_router))  # admin thumbnail
 
-    # Admin text/photo flows
-    app.add_handler(MessageHandler(filters.PHOTO, admin_photo_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler))
+    # admin text steps (add/edit product/variant/stock)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_router))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
