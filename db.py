@@ -4,33 +4,24 @@ from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-def db():
+def connect():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing. Set it in Railway Variables.")
+        raise RuntimeError("DATABASE_URL missing in Railway Variables")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-def fetch_all(sql: str, params: tuple = ()):
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            return list(cur.fetchall())
-
-def fetch_one(sql: str, params: tuple = ()):
-    rows = fetch_all(sql, params)
-    return rows[0] if rows else None
-
-def exec_sql(sql: str, params: tuple = ()):
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            conn.commit()
 
 def ensure_schema():
     ddl = """
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
-        balance INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        username TEXT,
+        joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        points INTEGER NOT NULL DEFAULT 0,
+        is_reseller BOOLEAN NOT NULL DEFAULT FALSE
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
     );
 
     CREATE TABLE IF NOT EXISTS categories (
@@ -43,8 +34,7 @@ def ensure_schema():
         category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
         name TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        is_active BOOLEAN NOT NULL DEFAULT TRUE
     );
 
     CREATE TABLE IF NOT EXISTS variants (
@@ -52,71 +42,48 @@ def ensure_schema():
         product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
         price INTEGER NOT NULL DEFAULT 0,
-        thumbnail_file_id TEXT,
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        delivery_type TEXT NOT NULL DEFAULT 'file', -- 'file' or 'text'
+        delivery_file_id TEXT,
+        delivery_text TEXT NOT NULL DEFAULT ''
     );
 
-    -- Each stock row = one deliverable item (email:pass line)
-    CREATE TABLE IF NOT EXISTS stock_items (
+    CREATE TABLE IF NOT EXISTS file_stocks (
         id SERIAL PRIMARY KEY,
         variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
-        payload TEXT NOT NULL,
+        file_id TEXT NOT NULL,
         is_sold BOOLEAN NOT NULL DEFAULT FALSE,
-        sold_at TIMESTAMP,
-        purchase_token TEXT,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        sold_to BIGINT,
+        sold_at TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS purchases (
         id SERIAL PRIMARY KEY,
-        purchase_token TEXT UNIQUE NOT NULL,
         user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
         variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE RESTRICT,
-        qty INTEGER NOT NULL,
-        unit_price INTEGER NOT NULL,
-        total_price INTEGER NOT NULL,
-        delivered BOOLEAN NOT NULL DEFAULT FALSE,
-        delivered_at TIMESTAMP,
+        price INTEGER NOT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS topups (
+    CREATE TABLE IF NOT EXISTS reseller_applications (
         id SERIAL PRIMARY KEY,
-        topup_id TEXT UNIQUE NOT NULL,
         user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-        amount INTEGER NOT NULL,
-        method TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'PENDING',
-        proof_file_id TEXT,
+        username TEXT,
+        full_name TEXT NOT NULL,
+        contact TEXT NOT NULL,
+        shop_link TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/REJECTED
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
         decided_at TIMESTAMP,
         admin_id BIGINT
     );
-
-    CREATE TABLE IF NOT EXISTS variants (
-  id SERIAL PRIMARY KEY,
-  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  price INTEGER NOT NULL DEFAULT 0,
-  stock INTEGER NOT NULL DEFAULT 0,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
-    CREATE INDEX IF NOT EXISTS idx_variants_product ON variants(product_id);    
-    CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
-    CREATE INDEX IF NOT EXISTS idx_variants_product ON variants(product_id);
-    CREATE INDEX IF NOT EXISTS idx_stock_variant_sold ON stock_items(variant_id, is_sold);
     """
-
-    with db() as conn:
-        with conn.cursor() as cur:
+    with connect() as db:
+        with db.cursor() as cur:
             cur.execute(ddl)
-            conn.commit()
+            db.commit()
 
-        # seed categories if empty
-        with conn.cursor() as cur:
+        with db.cursor() as cur:
             cur.execute("""
                 INSERT INTO categories(name) VALUES
                 ('Entertainment Prems'),
@@ -126,4 +93,36 @@ def ensure_schema():
                 ('Other Prems')
                 ON CONFLICT (name) DO NOTHING;
             """)
-            conn.commit()
+            db.commit()
+
+def fetch_all(sql, params=()):
+    with connect() as db:
+        with db.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+
+def fetch_one(sql, params=()):
+    rows = fetch_all(sql, params)
+    return rows[0] if rows else None
+
+def exec_sql(sql, params=()):
+    with connect() as db:
+        with db.cursor() as cur:
+            cur.execute(sql, params)
+            db.commit()
+
+def set_setting(key: str, value: str):
+    exec_sql("""
+        INSERT INTO settings(key,value) VALUES(%s,%s)
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+    """, (key, value))
+
+def get_setting(key: str):
+    r = fetch_one("SELECT value FROM settings WHERE key=%s", (key,))
+    return r["value"] if r else None
+
+def ensure_user(user_id: int, username: str | None):
+    exec_sql("""
+        INSERT INTO users(user_id, username) VALUES(%s,%s)
+        ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username
+    """, (user_id, username))
