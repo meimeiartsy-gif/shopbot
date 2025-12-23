@@ -229,7 +229,17 @@ def purchase_variant(user_id: int, variant_id: int, qty_units: int):
             """, (user_id, variant_id, qty_units, unit_price, total))
 
             # 1 order = 1 point
-            cur.execute("UPDATE users SET points=points+1 WHERE user_id=%s", (user_id,))
+            cur.execute("""
+    UPDATE users
+    SET
+        points = CASE
+            WHEN points_updated_at < NOW() - INTERVAL '25 days'
+                THEN 1
+            ELSE points + 1
+        END,
+        points_updated_at = NOW()
+    WHERE user_id = %s
+""", (user_id,))
 
         conn.commit()
 
