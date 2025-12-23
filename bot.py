@@ -21,6 +21,12 @@ log = logging.getLogger("shopbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
+# Railway vars (YOU HAVE THESE)
+ENV_GCASH_QR = os.getenv("GCASH_QR_FILE_ID", "").strip()
+ENV_GOTYME_QR = os.getenv("GOTYME_QR_FILE_ID", "").strip()
+ENV_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
+
+
 # -------------------- HELPERS --------------------
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
@@ -36,13 +42,13 @@ async def safe_answer(q):
 
 def build_main_menu(uid: int):
     rows = [
-        ["🏠 Home", "🛍 Shop"],
-        ["👤 My Account", "💰 Add Balance"],
-        ["📩 Reseller Register", "💬 Chat Admin"],
-        ["🆘 Help"],
+        ["Home", "Shop"],
+        ["My Account", "Add Balance"],
+        ["Reseller Register", "Chat Admin"],
+        ["Help"],
     ]
     if is_admin(uid):
-        rows.append(["🔐 Admin"])
+        rows.append(["Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 PANEL_TEXT_KEYS = {
@@ -62,6 +68,15 @@ PANEL_THUMB_KEYS = {
     "admin": "THUMB_ADMIN",
 }
 
+def get_qr_file_id(method: str) -> str | None:
+    """Prefer Railway env vars, fallback to settings (admin /setpay)."""
+    if method == "gcash":
+        return ENV_GCASH_QR or get_setting("PAY_GCASH_QR")
+    return ENV_GOTYME_QR or get_setting("PAY_GOTYME_QR")
+
+def get_admin_username() -> str:
+    return ENV_ADMIN_USERNAME or get_setting("ADMIN_USERNAME") or "@lovebylunaa"
+
 async def send_panel(msg, panel: str, default_text: str, menu=None):
     text_key = PANEL_TEXT_KEYS.get(panel, "")
     thumb_key = PANEL_THUMB_KEYS.get(panel, "")
@@ -79,6 +94,27 @@ async def send_panel(msg, panel: str, default_text: str, menu=None):
     else:
         await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=menu)
 
+async def edit_any(q, text: str, reply_markup=None):
+    """
+    Fixes your log error:
+    BadRequest: There is no text in the message to edit
+    - If message is a photo -> edit caption
+    - Else -> edit text
+    """
+    try:
+        if getattr(q.message, "photo", None):
+            await q.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        else:
+            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    except Exception as e:
+        log.exception("edit_any failed: %s", e)
+        # fallback: send new message
+        try:
+            await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        except Exception:
+            pass
+
+
 # -------------------- START / HOME --------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -90,15 +126,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         menu=build_main_menu(user.id)
     )
 
-async def home_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user.id, user.username)
-    await send_panel(
-        update.message,
-        "home",
-        "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:",
-        menu=build_main_menu(user.id)
-    )
 
 # -------------------- HELP / CHAT ADMIN --------------------
 async def help_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,8 +137,8 @@ async def help_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_user = get_setting("ADMIN_USERNAME") or "@lovebylunaa"
-    await update.message.reply_text(f"💬 Chat admin here:\n{admin_user}")
+    await update.message.reply_text(f"💬 Chat admin here:\n{get_admin_username()}")
+
 
 # -------------------- MY ACCOUNT --------------------
 async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -140,6 +167,7 @@ async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await send_panel(update.message, "account", text, menu=None)
 
+
 # -------------------- SHOP UI --------------------
 async def shop_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
@@ -159,79 +187,83 @@ async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
-    parts = q.data.split(":")
-    action = parts[1]
+    try:
+        parts = q.data.split(":")
+        action = parts[1]
 
-    if action == "backcats":
-        cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
-        rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-        await q.edit_message_text(
-            "🛍 **Shop Categories**",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
-        return
-
-    if action == "cat":
-        cat_id = int(parts[2])
-        prods = fetch_all("""
-            SELECT id,name FROM products
-            WHERE is_active=TRUE AND category_id=%s
-            ORDER BY id
-        """, (cat_id,))
-
-        if not prods:
-            await q.edit_message_text(
-                "No products yet in this category.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")]])
-            )
+        if action == "backcats":
+            cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
+            rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
+            await edit_any(q, "🛍 **Shop Categories**", InlineKeyboardMarkup(rows))
             return
 
-        rows = [[InlineKeyboardButton(p["name"], callback_data=f"shop:prod:{p['id']}")] for p in prods]
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")])
-        await q.edit_message_text("Select a product:", reply_markup=InlineKeyboardMarkup(rows))
-        return
+        if action == "cat":
+            cat_id = int(parts[2])
+            prods = fetch_all("""
+                SELECT id,name FROM products
+                WHERE is_active=TRUE AND category_id=%s
+                ORDER BY id
+            """, (cat_id,))
 
-    if action == "prod":
-        pid = int(parts[2])
-        prod = fetch_one("SELECT id,name,description FROM products WHERE id=%s AND is_active=TRUE", (pid,))
-        if not prod:
-            await q.edit_message_text("Product not found.")
+            if not prods:
+                await edit_any(
+                    q,
+                    "No products yet in this category.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")]])
+                )
+                return
+
+            rows = [[InlineKeyboardButton(p["name"], callback_data=f"shop:prod:{p['id']}")] for p in prods]
+            rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")])
+            await edit_any(q, "Select a product:", InlineKeyboardMarkup(rows))
             return
 
-        vars_ = fetch_all("""
-            SELECT id,name,price,bundle_qty,delivery_type FROM variants
-            WHERE product_id=%s AND is_active=TRUE
-            ORDER BY id
-        """, (pid,))
+        if action == "prod":
+            pid = int(parts[2])
+            prod = fetch_one("SELECT id,name,description FROM products WHERE id=%s AND is_active=TRUE", (pid,))
+            if not prod:
+                await edit_any(q, "Product not found.")
+                return
 
-        if not vars_:
-            await q.edit_message_text(
-                "No packages yet.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")]])
-            )
+            vars_ = fetch_all("""
+                SELECT id,name,price,bundle_qty,delivery_type FROM variants
+                WHERE product_id=%s AND is_active=TRUE
+                ORDER BY id
+            """, (pid,))
+
+            if not vars_:
+                await edit_any(
+                    q,
+                    "No packages yet.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")]])
+                )
+                return
+
+            rows = []
+            for v in vars_:
+                available_items = fetch_one(
+                    "SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE",
+                    (v["id"],)
+                )
+                stock_items = int(available_items["c"]) if available_items else 0
+                bundle_qty = int(v["bundle_qty"])
+                stock_units = stock_items // bundle_qty if bundle_qty > 0 else 0
+
+                rows.append([InlineKeyboardButton(
+                    f"{v['name']} — {money(int(v['price']))} (Stock: {stock_units})",
+                    callback_data=f"buy:open:{v['id']}"
+                )])
+
+            rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")])
+
+            text = f"🧾 **{prod['name']}**\n\n{prod.get('description') or ''}\n\nChoose a package below:"
+            await edit_any(q, text, InlineKeyboardMarkup(rows))
             return
 
-        rows = []
-        for v in vars_:
-            available_items = fetch_one(
-                "SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE",
-                (v["id"],)
-            )
-            stock_items = int(available_items["c"]) if available_items else 0
-            bundle_qty = int(v["bundle_qty"])
-            stock_units = stock_items // bundle_qty if bundle_qty > 0 else 0
+    except Exception as e:
+        log.exception("cb_shop error: %s", e)
+        await q.message.reply_text("⚠️ Shop error. Please try again.")
 
-            rows.append([InlineKeyboardButton(
-                f"{v['name']} — {money(int(v['price']))} (Stock: {stock_units})",
-                callback_data=f"buy:open:{v['id']}"
-            )])
-
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:backcats")])
-
-        text = f"🧾 **{prod['name']}**\n\n{prod.get('description') or ''}\n\nChoose a package below:"
-        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
-        return
 
 # -------------------- CHECKOUT UI --------------------
 def checkout_keyboard(qty: int, variant_id: int):
@@ -257,7 +289,7 @@ async def show_checkout(q, user_id: int, variant_id: int, qty: int):
         WHERE v.id=%s AND v.is_active=TRUE
     """, (variant_id,))
     if not v:
-        await q.edit_message_text("Package not found.")
+        await edit_any(q, "Package not found.")
         return
 
     u = fetch_one("SELECT balance FROM users WHERE user_id=%s", (user_id,))
@@ -284,119 +316,127 @@ async def show_checkout(q, user_id: int, variant_id: int, qty: int):
         "Adjust quantity then confirm:"
     )
 
-    await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=checkout_keyboard(qty, variant_id))
+    await edit_any(q, text, checkout_keyboard(qty, variant_id))
 
 async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
-    user = q.from_user
-    ensure_user(user.id, user.username)
+    try:
+        user = q.from_user
+        ensure_user(user.id, user.username)
 
-    parts = q.data.split(":")
-    action = parts[1]
+        parts = q.data.split(":")
+        action = parts[1]
 
-    if action == "open":
-        variant_id = int(parts[2])
-        context.user_data["checkout_variant"] = variant_id
-        context.user_data["checkout_qty"] = 1
-        await show_checkout(q, user.id, variant_id, 1)
-        return
-
-    if action == "qty":
-        variant_id = int(parts[2])
-        delta = int(parts[3].replace("+", ""))
-
-        if context.user_data.get("checkout_variant") != variant_id:
+        if action == "open":
+            variant_id = int(parts[2])
             context.user_data["checkout_variant"] = variant_id
             context.user_data["checkout_qty"] = 1
-
-        qty = int(context.user_data.get("checkout_qty", 1))
-        qty = max(1, qty + delta)
-        context.user_data["checkout_qty"] = qty
-
-        await show_checkout(q, user.id, variant_id, qty)
-        return
-
-    if action == "cancel":
-        context.user_data.pop("checkout_variant", None)
-        context.user_data.pop("checkout_qty", None)
-        await q.edit_message_text("❌ Cancelled. Tap **Shop** to browse again.", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if action == "confirm":
-        variant_id = int(parts[2])
-        qty = int(context.user_data.get("checkout_qty", 1))
-
-        result = purchase_variant(user.id, variant_id, qty)
-
-        if not result["ok"]:
-            if result["error"] == "NOT_ENOUGH_BALANCE":
-                await q.edit_message_text(
-                    f"❌ Not enough balance.\nNeed {money(result['need'])}, you have {money(result['have'])}.",
-                    reply_markup=checkout_keyboard(qty, variant_id)
-                )
-                return
-            if result["error"] == "NOT_ENOUGH_STOCK":
-                await q.edit_message_text(
-                    f"❌ Not enough stock.\nNeed {result['need']} item(s), only {result['have']} available.",
-                    reply_markup=checkout_keyboard(qty, variant_id)
-                )
-                return
-
-            await q.edit_message_text("❌ Purchase failed.")
+            await show_checkout(q, user.id, variant_id, 1)
             return
 
-        v = result["variant"]
-        stocks = result["stocks"]
-        total = result["total"]
+        if action == "qty":
+            variant_id = int(parts[2])
+            delta = int(parts[3].replace("+", ""))
 
-        # deliver AFTER transaction success
-        try:
-            if v["delivery_type"] == "file":
-                sent = 0
-                for s in stocks:
-                    if s.get("file_id"):
-                        await context.bot.send_document(
-                            chat_id=user.id,
-                            document=s["file_id"],
-                            caption=f"✅ Delivery: {v['product_name']} — {v['name']}"
-                        )
-                        sent += 1
-                await context.bot.send_message(user.id, f"✅ Delivered {sent} file(s). Total paid: {money(total)}")
-            else:
-                lines = []
-                for s in stocks:
-                    if s.get("delivery_text"):
-                        lines.append(s["delivery_text"])
-                if not lines:
-                    lines = ["(No delivery text found in stock rows)"]
-                chunk = "\n".join(lines)
+            if context.user_data.get("checkout_variant") != variant_id:
+                context.user_data["checkout_variant"] = variant_id
+                context.user_data["checkout_qty"] = 1
+
+            qty = int(context.user_data.get("checkout_qty", 1))
+            qty = max(1, qty + delta)
+            context.user_data["checkout_qty"] = qty
+
+            await show_checkout(q, user.id, variant_id, qty)
+            return
+
+        if action == "cancel":
+            context.user_data.pop("checkout_variant", None)
+            context.user_data.pop("checkout_qty", None)
+            await edit_any(q, "❌ Cancelled. Tap **Shop** to browse again.")
+            return
+
+        if action == "confirm":
+            variant_id = int(parts[2])
+            qty = int(context.user_data.get("checkout_qty", 1))
+
+            result = purchase_variant(user.id, variant_id, qty)
+
+            if not result["ok"]:
+                if result["error"] == "NOT_ENOUGH_BALANCE":
+                    await edit_any(
+                        q,
+                        f"❌ Not enough balance.\nNeed {money(result['need'])}, you have {money(result['have'])}.",
+                        checkout_keyboard(qty, variant_id)
+                    )
+                    return
+                if result["error"] == "NOT_ENOUGH_STOCK":
+                    await edit_any(
+                        q,
+                        f"❌ Not enough stock.\nNeed {result['need']} item(s), only {result['have']} available.",
+                        checkout_keyboard(qty, variant_id)
+                    )
+                    return
+
+                await edit_any(q, "❌ Purchase failed.")
+                return
+
+            v = result["variant"]
+            stocks = result["stocks"]
+            total = result["total"]
+
+            # deliver AFTER transaction success
+            try:
+                if v["delivery_type"] == "file":
+                    sent = 0
+                    for s in stocks:
+                        if s.get("file_id"):
+                            await context.bot.send_document(
+                                chat_id=user.id,
+                                document=s["file_id"],
+                                caption=f"✅ Delivery: {v['product_name']} — {v['name']}"
+                            )
+                            sent += 1
+                    await context.bot.send_message(user.id, f"✅ Delivered {sent} file(s). Total paid: {money(total)}")
+                else:
+                    lines = []
+                    for s in stocks:
+                        if s.get("delivery_text"):
+                            lines.append(s["delivery_text"])
+                    if not lines:
+                        lines = ["(No delivery text found in stock rows)"]
+                    chunk = "\n".join(lines)
+                    await context.bot.send_message(
+                        user.id,
+                        f"✅ **Delivery**: {v['product_name']} — {v['name']}\n"
+                        f"Total paid: **{money(total)}**\n\n"
+                        f"{chunk}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+            except Exception as e:
+                log.exception("Delivery failed: %s", e)
                 await context.bot.send_message(
                     user.id,
-                    f"✅ **Delivery**: {v['product_name']} — {v['name']}\n"
-                    f"Total paid: **{money(total)}**\n\n"
-                    f"{chunk}",
-                    parse_mode=ParseMode.MARKDOWN
+                    "⚠️ Payment & stock were processed, but delivery failed to send.\n"
+                    "Please contact admin."
                 )
-        except Exception as e:
-            # If delivery fails (Telegram error), do NOT hide it.
-            log.exception("Delivery failed: %s", e)
-            await context.bot.send_message(
-                user.id,
-                "⚠️ Payment & stock were processed, but delivery failed to send.\n"
-                "Please contact admin."
-            )
 
-        context.user_data.pop("checkout_variant", None)
-        context.user_data.pop("checkout_qty", None)
-        await q.edit_message_text("✅ Purchase completed! Tap **Shop** to buy again.", parse_mode=ParseMode.MARKDOWN)
-        return
+            context.user_data.pop("checkout_variant", None)
+            context.user_data.pop("checkout_qty", None)
+            await edit_any(q, "✅ Purchase completed! Tap **Shop** to buy again.")
+            return
 
-# -------------------- NOOP (fix “not responding” on Qty button) --------------------
+    except Exception as e:
+        log.exception("cb_buy error: %s", e)
+        await q.message.reply_text("⚠️ Checkout error. Please try again.")
+
+
+# -------------------- NOOP --------------------
 async def cb_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
+
 
 # -------------------- ADD BALANCE (buttons + QR) --------------------
 TOPUP_AMOUNTS = [50, 100, 300, 1000]
@@ -412,10 +452,7 @@ async def add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username)
 
-    text = (
-        "💰 **Add Balance**\n\n"
-        "Choose payment method:"
-    )
+    text = "💰 **Add Balance**\n\nChoose payment method:"
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📱 GCash", callback_data="topup:pay:gcash"),
@@ -430,94 +467,95 @@ async def cb_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
-    parts = q.data.split(":")
-    action = parts[1]
+    try:
+        parts = q.data.split(":")
+        action = parts[1]
 
-    if action == "cancel":
-        for k in ("topup_step", "topup_method", "topup_amount"):
-            context.user_data.pop(k, None)
-        await q.edit_message_text("❌ Cancelled.")
-        return
-
-    if action == "pay":
-        method = parts[2]
-        context.user_data["topup_method"] = method
-        context.user_data["topup_step"] = "choose_amount"
-
-        qr_key = "PAY_GCASH_QR" if method == "gcash" else "PAY_GOTYME_QR"
-        qr = get_setting(qr_key)
-
-        caption = (
-            f"✅ **{method.upper()} selected**\n\n"
-            "1) Pay now\n"
-            "2) Choose amount below\n"
-            "3) Then send proof screenshot (PHOTO)"
-        )
-
-        if qr:
-            await q.message.reply_photo(photo=qr, caption=caption, parse_mode=ParseMode.MARKDOWN,
-                                        reply_markup=topup_amount_keyboard())
-        else:
-            await q.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN, reply_markup=topup_amount_keyboard())
-        return
-
-    if action == "amt":
-        amt = int(parts[2])
-        context.user_data["topup_amount"] = amt
-        context.user_data["topup_step"] = "await_proof"
-        await q.edit_message_text(
-            f"✅ Amount selected: **{money(amt)}**\n\nNow send your **proof screenshot** as PHOTO.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    # admin approve/reject
-    if action in ("ok", "no"):
-        if not is_admin(q.from_user.id):
-            await q.message.reply_text("❌ Access denied.")
+        if action == "cancel":
+            for k in ("topup_step", "topup_method", "topup_amount"):
+                context.user_data.pop(k, None)
+            await edit_any(q, "❌ Cancelled.")
             return
 
-        req_id = int(parts[2])
-        req = fetch_one("SELECT * FROM topup_requests WHERE id=%s", (req_id,))
-        if not req or req["status"] != "PENDING":
-            try:
-                await q.edit_message_caption("Already decided.")
-            except Exception:
-                await q.edit_message_text("Already decided.")
+        if action == "pay":
+            method = parts[2]
+            context.user_data["topup_method"] = method
+            context.user_data["topup_step"] = "choose_amount"
+
+            qr = get_qr_file_id(method)
+
+            caption = (
+                f"✅ **{method.upper()} selected**\n\n"
+                "1) Pay now\n"
+                "2) Choose amount below\n"
+                "3) Then send proof screenshot (PHOTO)"
+            )
+
+            # Always show QR if we have it
+            if qr:
+                await q.message.reply_photo(
+                    photo=qr,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=topup_amount_keyboard()
+                )
+                # also update the old message to remove buttons (optional)
+                try:
+                    await edit_any(q, "✅ Payment method selected. QR sent below.")
+                except Exception:
+                    pass
+            else:
+                await edit_any(q, caption, topup_amount_keyboard())
             return
 
-        if action == "ok":
-            exec_sql("UPDATE users SET balance=balance+%s WHERE user_id=%s", (int(req["amount"]), int(req["user_id"])))
-            exec_sql(
-                "UPDATE topup_requests SET status='APPROVED', decided_at=NOW(), admin_id=%s WHERE id=%s",
-                (q.from_user.id, req_id)
+        if action == "amt":
+            amt = int(parts[2])
+            context.user_data["topup_amount"] = amt
+            context.user_data["topup_step"] = "await_proof"
+            await edit_any(
+                q,
+                f"✅ Amount selected: **{money(amt)}**\n\nNow send your **proof screenshot** as PHOTO."
             )
-            await context.bot.send_message(int(req["user_id"]), f"✅ Topup approved! Added {money(int(req['amount']))}")
-            try:
-                await q.edit_message_caption("✅ Approved")
-            except Exception:
-                await q.edit_message_text("✅ Approved")
-        else:
-            exec_sql(
-                "UPDATE topup_requests SET status='REJECTED', decided_at=NOW(), admin_id=%s WHERE id=%s",
-                (q.from_user.id, req_id)
-            )
-            await context.bot.send_message(int(req["user_id"]), "❌ Topup rejected.")
-            try:
-                await q.edit_message_caption("❌ Rejected")
-            except Exception:
-                await q.edit_message_text("❌ Rejected")
-        return
+            return
+
+        # admin approve/reject
+        if action in ("ok", "no"):
+            if not is_admin(q.from_user.id):
+                await q.message.reply_text("❌ Access denied.")
+                return
+
+            req_id = int(parts[2])
+            req = fetch_one("SELECT * FROM topup_requests WHERE id=%s", (req_id,))
+            if not req or req["status"] != "PENDING":
+                await q.message.reply_text("Already decided.")
+                return
+
+            if action == "ok":
+                exec_sql("UPDATE users SET balance=balance+%s WHERE user_id=%s", (int(req["amount"]), int(req["user_id"])))
+                exec_sql(
+                    "UPDATE topup_requests SET status='APPROVED', decided_at=NOW(), admin_id=%s WHERE id=%s",
+                    (q.from_user.id, req_id)
+                )
+                await context.bot.send_message(int(req["user_id"]), f"✅ Topup approved! Added {money(int(req['amount']))}")
+                await q.message.reply_text("✅ Approved")
+            else:
+                exec_sql(
+                    "UPDATE topup_requests SET status='REJECTED', decided_at=NOW(), admin_id=%s WHERE id=%s",
+                    (q.from_user.id, req_id)
+                )
+                await context.bot.send_message(int(req["user_id"]), "❌ Topup rejected.")
+                await q.message.reply_text("❌ Rejected")
+            return
+
+    except Exception as e:
+        log.exception("cb_topup error: %s", e)
+        await q.message.reply_text("⚠️ Add Balance error. Please try again.")
+
 
 async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    SINGLE photo handler (prevents conflicts).
-    - handles topup proof
-    - handles admin setthumb/setpay
-    """
     user = update.effective_user
 
-    # 1) topup proof
+    # topup proof
     if context.user_data.get("topup_step") == "await_proof":
         ensure_user(user.id, user.username)
 
@@ -559,7 +597,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Submitted! Waiting for admin approval.")
         return
 
-    # 2) admin setthumb
+    # admin setthumb
     if is_admin(user.id) and context.user_data.get("await_thumb_panel"):
         panel = context.user_data.pop("await_thumb_panel")
         file_id = update.message.photo[-1].file_id
@@ -567,7 +605,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Thumbnail saved for {panel}.")
         return
 
-    # 3) admin setpay
+    # admin setpay
     if is_admin(user.id) and context.user_data.get("await_pay_qr"):
         method = context.user_data.pop("await_pay_qr")
         file_id = update.message.photo[-1].file_id
@@ -575,6 +613,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting(key, file_id)
         await update.message.reply_text(f"✅ {method.upper()} QR saved!")
         return
+
 
 # -------------------- RESELLER REGISTER --------------------
 async def reseller_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -614,6 +653,7 @@ async def reseller_form_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await update.message.reply_text("✅ Submitted! Waiting for admin approval 💗")
 
+
 # -------------------- ADMIN PANEL --------------------
 def admin_panel_keyboard():
     return InlineKeyboardMarkup([
@@ -629,7 +669,6 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "🔐 **Admin Panel** ✅\n\n"
-        "**Quick buttons below**\n\n"
         "Commands:\n"
         "• `/settext <home|shop|help|account|addbal|admin> <text>`\n"
         "• `/setthumb <home|shop|help|account|addbal|admin>` then send PHOTO\n"
@@ -647,102 +686,104 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("❌ Access denied.")
         return
 
-    parts = q.data.split(":")
-    # admin:topups:pending
-    if parts[1] == "topups" and parts[2] == "pending":
-        rows = fetch_all("""
-            SELECT id, user_id, amount, created_at
-            FROM topup_requests
-            WHERE status='PENDING'
-            ORDER BY id DESC
-            LIMIT 20
-        """)
-        if not rows:
-            await q.edit_message_text("✅ No pending topups.")
+    try:
+        parts = q.data.split(":")
+
+        if parts[1] == "topups" and parts[2] == "pending":
+            rows = fetch_all("""
+                SELECT id, user_id, amount, created_at
+                FROM topup_requests
+                WHERE status='PENDING'
+                ORDER BY id DESC
+                LIMIT 20
+            """)
+            if not rows:
+                await edit_any(q, "✅ No pending topups.")
+                return
+
+            lines = ["💰 **Pending Topups** (latest 20)\n"]
+            kb_rows = []
+            for r in rows:
+                lines.append(f"• #{r['id']} — `{r['user_id']}` — **{money(r['amount'])}** — {r['created_at']}")
+                kb_rows.append([InlineKeyboardButton(f"View #{r['id']}", callback_data=f"admin:topup:view:{r['id']}")])
+
+            await edit_any(q, "\n".join(lines), InlineKeyboardMarkup(kb_rows))
             return
 
-        lines = ["💰 **Pending Topups** (latest 20)\n"]
-        kb_rows = []
-        for r in rows:
-            lines.append(f"• #{r['id']} — `{r['user_id']}` — **{money(r['amount'])}** — {r['created_at']}")
-            kb_rows.append([InlineKeyboardButton(f"View #{r['id']}", callback_data=f"admin:topup:view:{r['id']}")])
+        if parts[1] == "topup" and parts[2] == "view":
+            req_id = int(parts[3])
+            req = fetch_one("SELECT * FROM topup_requests WHERE id=%s", (req_id,))
+            if not req:
+                await edit_any(q, "Not found.")
+                return
 
-        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb_rows))
-        return
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"topup:ok:{req_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"topup:no:{req_id}")
+            ]])
 
-    # admin:topup:view:<id>
-    if parts[1] == "topup" and parts[2] == "view":
-        req_id = int(parts[3])
-        req = fetch_one("SELECT * FROM topup_requests WHERE id=%s", (req_id,))
-        if not req:
-            await q.edit_message_text("Not found.")
-            return
-
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"topup:ok:{req_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"topup:no:{req_id}")
-        ]])
-
-        # show proof photo again
-        await q.message.reply_photo(
-            photo=req["proof_file_id"],
-            caption=(
-                "💰 **Topup Request**\n\n"
-                f"Request: **#{req_id}**\n"
-                f"User ID: `{req['user_id']}`\n"
-                f"Amount: **{money(req['amount'])}**\n"
-                f"Status: **{req['status']}**"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb
-        )
-        await q.edit_message_text("Opened topup proof above ✅")
-        return
-
-    # admin:users:list
-    if parts[1] == "users" and parts[2] == "list":
-        rows = fetch_all("""
-            SELECT u.user_id, u.username, u.balance, u.points, u.is_reseller,
-                   (SELECT COUNT(*) FROM purchases p WHERE p.user_id=u.user_id) AS purchases
-            FROM users u
-            ORDER BY u.joined_at DESC
-            LIMIT 30
-        """)
-        if not rows:
-            await q.edit_message_text("No users yet.")
-            return
-
-        lines = ["👥 **Users (latest 30)**\n"]
-        for r in rows:
-            uname = f"@{r['username']}" if r.get("username") else "(no username)"
-            lines.append(
-                f"• `{r['user_id']}` {uname} | Bal: **{money(r['balance'])}** | Buy: **{r['purchases']}** | "
-                f"Pts: **{r['points']}** | Reseller: {'✅' if r['is_reseller'] else '❌'}"
+            await q.message.reply_photo(
+                photo=req["proof_file_id"],
+                caption=(
+                    "💰 **Topup Request**\n\n"
+                    f"Request: **#{req_id}**\n"
+                    f"User ID: `{req['user_id']}`\n"
+                    f"Amount: **{money(req['amount'])}**\n"
+                    f"Status: **{req['status']}**"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb
             )
-
-        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # admin:purchases:last10
-    if parts[1] == "purchases" and parts[2] == "last10":
-        rows = fetch_all("""
-            SELECT p.id, p.user_id, p.variant_id, p.quantity, p.total_price, p.created_at
-            FROM purchases p
-            ORDER BY p.id DESC
-            LIMIT 10
-        """)
-        if not rows:
-            await q.edit_message_text("No purchases yet.")
+            await edit_any(q, "Opened topup proof above ✅")
             return
 
-        lines = ["🧾 **Last 10 Purchases**\n"]
-        for r in rows:
-            lines.append(
-                f"• #{r['id']} — `{r['user_id']}` — variant `{r['variant_id']}` — qty **{r['quantity']}** — "
-                f"paid **{money(r['total_price'])}** — {r['created_at']}"
-            )
-        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-        return
+        if parts[1] == "users" and parts[2] == "list":
+            rows = fetch_all("""
+                SELECT u.user_id, u.username, u.balance, u.points, u.is_reseller,
+                       (SELECT COUNT(*) FROM purchases p WHERE p.user_id=u.user_id) AS purchases
+                FROM users u
+                ORDER BY u.joined_at DESC
+                LIMIT 30
+            """)
+            if not rows:
+                await edit_any(q, "No users yet.")
+                return
+
+            lines = ["👥 **Users (latest 30)**\n"]
+            for r in rows:
+                uname = f"@{r['username']}" if r.get("username") else "(no username)"
+                lines.append(
+                    f"• `{r['user_id']}` {uname} | Bal: **{money(r['balance'])}** | Buy: **{r['purchases']}** | "
+                    f"Pts: **{r['points']}** | Reseller: {'✅' if r['is_reseller'] else '❌'}"
+                )
+
+            await edit_any(q, "\n".join(lines))
+            return
+
+        if parts[1] == "purchases" and parts[2] == "last10":
+            rows = fetch_all("""
+                SELECT p.id, p.user_id, p.variant_id, p.quantity, p.total_price, p.created_at
+                FROM purchases p
+                ORDER BY p.id DESC
+                LIMIT 10
+            """)
+            if not rows:
+                await edit_any(q, "No purchases yet.")
+                return
+
+            lines = ["🧾 **Last 10 Purchases**\n"]
+            for r in rows:
+                lines.append(
+                    f"• #{r['id']} — `{r['user_id']}` — variant `{r['variant_id']}` — qty **{r['quantity']}** — "
+                    f"paid **{money(r['total_price'])}** — {r['created_at']}"
+                )
+            await edit_any(q, "\n".join(lines))
+            return
+
+    except Exception as e:
+        log.exception("cb_admin error: %s", e)
+        await q.message.reply_text("⚠️ Admin error. Please try again.")
+
 
 # -------------------- ADMIN COMMANDS --------------------
 async def settext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -826,6 +867,53 @@ async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text("Replied message has no photo/document.")
 
+
+# -------------------- ONE TEXT ROUTER (fix emoji regex issues) --------------------
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user = update.effective_user
+    ensure_user(user.id, user.username)
+
+    t = update.message.text.strip().lower()
+
+    if t in ("home", "🏠 home"):
+        await send_panel(update.message, "home", "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:", menu=build_main_menu(user.id))
+        return
+
+    if t in ("shop", "🛍 shop"):
+        await shop_btn(update, context)
+        return
+
+    if t in ("my account", "👤 my account"):
+        await my_account(update, context)
+        return
+
+    if t in ("add balance", "💰 add balance"):
+        await add_balance(update, context)
+        return
+
+    if t in ("reseller register", "📩 reseller register"):
+        await reseller_register(update, context)
+        return
+
+    if t in ("chat admin", "💬 chat admin"):
+        await chat_admin(update, context)
+        return
+
+    if t in ("help", "🆘 help"):
+        await help_btn(update, context)
+        return
+
+    if t in ("admin", "🔐 admin"):
+        await admin_cmd(update, context)
+        return
+
+    # reseller form continues here
+    await reseller_form_text(update, context)
+
+
 # -------------------- BOOT --------------------
 def main():
     if not BOT_TOKEN:
@@ -844,16 +932,6 @@ def main():
     app.add_handler(CommandHandler("addbal", addbal_cmd))
     app.add_handler(CommandHandler("fileid", fileid_cmd))
 
-    # Menu buttons
-    app.add_handler(MessageHandler(filters.Regex(r"^🏠 Home$"), home_btn))
-    app.add_handler(MessageHandler(filters.Regex(r"^🛍 Shop$"), shop_btn))
-    app.add_handler(MessageHandler(filters.Regex(r"^👤 My Account$"), my_account))
-    app.add_handler(MessageHandler(filters.Regex(r"^💰 Add Balance$"), add_balance))
-    app.add_handler(MessageHandler(filters.Regex(r"^📩 Reseller Register$"), reseller_register))
-    app.add_handler(MessageHandler(filters.Regex(r"^💬 Chat Admin$"), chat_admin))
-    app.add_handler(MessageHandler(filters.Regex(r"^🆘 Help$"), help_btn))
-    app.add_handler(MessageHandler(filters.Regex(r"^🔐 Admin$"), admin_cmd))
-
     # Callbacks
     app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(cb_shop, pattern=r"^shop:"))
@@ -861,11 +939,11 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_topup, pattern=r"^topup:"))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin:"))
 
-    # One photo handler only (proof + admin uploads)
+    # Photo handler
     app.add_handler(MessageHandler(filters.PHOTO, photo_router))
 
-    # Reseller form steps
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reseller_form_text))
+    # Single text router (IMPORTANT fix)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     # IMPORTANT:
     # If you see "terminated by other getUpdates request",
