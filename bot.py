@@ -524,6 +524,38 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("❌ Rejected.")
             return
 
+# -------------------- ADMIN: GET FILE ID --------------------
+async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    await update.message.reply_text(
+        "📎 Send the file now as a *DOCUMENT*.\n"
+        "I will reply with its file_id.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    context.user_data["await_fileid"] = True
+
+
+async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.user_data.get("await_fileid"):
+        return
+    if not update.message.document:
+        await update.message.reply_text("❌ Please send as DOCUMENT.")
+        return
+
+    file_id = update.message.document.file_id
+    context.user_data["await_fileid"] = False
+
+    await update.message.reply_text(
+        f"✅ **File ID captured:**\n\n`{file_id}`\n\n"
+        "Copy this and paste it into PostgreSQL.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
 
 # ============================================================
 # BOOT
