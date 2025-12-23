@@ -591,6 +591,11 @@ def main():
     # Text handler (reseller form + admin edit texts)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
+    # Admin: get Telegram file_id
+app.add_handler(CommandHandler("fileid", fileid_cmd))
+app.add_handler(MessageHandler(filters.Document.ALL, capture_fileid))
+
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
