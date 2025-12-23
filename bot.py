@@ -119,7 +119,10 @@ async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username)
 
-    u = fetch_one("SELECT user_id, username, joined_at, points, is_reseller FROM users WHERE user_id=%s", (user.id,))
+    u = fetch_one(
+        "SELECT user_id, username, joined_at, points, is_reseller FROM users WHERE user_id=%s",
+        (user.id,)
+    )
     purchases = fetch_one("SELECT COUNT(*) AS c FROM purchases WHERE user_id=%s", (user.id,))
     count = int(purchases["c"]) if purchases else 0
 
@@ -228,7 +231,6 @@ async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (pid,))
 
         if not vars_:
-            # back to products list
             cat_id = context.user_data.get("shop_cat_id")
             back_cb = f"shop:cat:{cat_id}" if cat_id else "shop:back"
             await q.message.edit_text(
@@ -241,14 +243,16 @@ async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rows = []
         for v in vars_:
-            stock = fetch_one("SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE", (v["id"],))
+            stock = fetch_one(
+                "SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE",
+                (v["id"],)
+            )
             s = int(stock["c"]) if stock else 0
             rows.append([InlineKeyboardButton(
                 f"{v['name']} — {money(int(v['price']))} (Stock: {s})",
                 callback_data=f"buy:{v['id']}"
             )])
 
-        # back to product list
         cat_id = context.user_data.get("shop_cat_id")
         back_cb = f"shop:cat:{cat_id}" if cat_id else "shop:back"
         rows.append([InlineKeyboardButton("⬅ Back", callback_data=back_cb)])
@@ -406,7 +410,12 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thumb = get_setting("ADMIN_THUMB_FILE_ID")
 
     if thumb:
-        await update.message.reply_photo(photo=thumb, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_panel_kb())
+        await update.message.reply_photo(
+            photo=thumb,
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=admin_panel_kb()
+        )
     else:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_panel_kb())
 
@@ -464,7 +473,6 @@ async def cb_adminpanel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "close":
         await q.message.edit_text("✅ Closed.")
         return
-
 
 async def capture_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -524,19 +532,20 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("❌ Rejected.")
             return
 
-# -------------------- ADMIN: GET FILE ID --------------------
+
+# ============================================================
+# ADMIN: GET TELEGRAM FILE_ID
+# ============================================================
 async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Admin only.")
         return
 
     await update.message.reply_text(
-        "📎 Send the file now as a *DOCUMENT*.\n"
-        "I will reply with its file_id.",
+        "📎 Send the file now as a *DOCUMENT*.\nI will reply with its file_id.",
         parse_mode=ParseMode.MARKDOWN
     )
     context.user_data["await_fileid"] = True
-
 
 async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -551,8 +560,7 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["await_fileid"] = False
 
     await update.message.reply_text(
-        f"✅ **File ID captured:**\n\n`{file_id}`\n\n"
-        "Copy this and paste it into PostgreSQL.",
+        f"✅ **File ID captured:**\n\n`{file_id}`\n\nCopy this and paste it into PostgreSQL.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -568,7 +576,9 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("fileid", fileid_cmd))
 
     # Menu buttons
     app.add_handler(MessageHandler(filters.Regex(r"^🏠 Home$"), home_btn))
@@ -588,13 +598,11 @@ def main():
     # Admin photo capture for thumbnails
     app.add_handler(MessageHandler(filters.PHOTO, capture_thumb))
 
+    # Capture file_id from DOCUMENT (for /fileid)
+    app.add_handler(MessageHandler(filters.Document.ALL, capture_fileid))
+
     # Text handler (reseller form + admin edit texts)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    # Admin: get Telegram file_id
-app.add_handler(CommandHandler("fileid", fileid_cmd))
-app.add_handler(MessageHandler(filters.Document.ALL, capture_fileid))
-
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
