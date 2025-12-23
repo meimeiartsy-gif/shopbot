@@ -43,12 +43,10 @@ def ensure_schema():
         product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
         price INTEGER NOT NULL DEFAULT 0,
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        delivery_type TEXT NOT NULL DEFAULT 'text', -- 'file' or 'text'
-        delivery_file_id TEXT,
-        delivery_text TEXT NOT NULL DEFAULT ''
+        is_active BOOLEAN NOT NULL DEFAULT TRUE
     );
 
+    -- Stocks: either file_id OR delivery_text
     CREATE TABLE IF NOT EXISTS file_stocks (
         id SERIAL PRIMARY KEY,
         variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
@@ -56,12 +54,7 @@ def ensure_schema():
         delivery_text TEXT,
         is_sold BOOLEAN NOT NULL DEFAULT FALSE,
         sold_to BIGINT,
-        sold_at TIMESTAMP,
-        CONSTRAINT file_stocks_payload_chk CHECK (
-          (file_id IS NOT NULL AND length(file_id) > 0)
-          OR
-          (delivery_text IS NOT NULL AND length(delivery_text) > 0)
-        )
+        sold_at TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS purchases (
@@ -69,7 +62,6 @@ def ensure_schema():
         user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
         variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE RESTRICT,
         qty INTEGER NOT NULL DEFAULT 1,
-        price_each INTEGER NOT NULL,
         total_price INTEGER NOT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
@@ -92,6 +84,32 @@ def ensure_schema():
             cur.execute(ddl)
             db.commit()
 
+        # --- migrations for older DBs ---
+        with db.cursor() as cur:
+            # users.balance
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER NOT NULL DEFAULT 0;")
+            # purchases.qty + total_price
+            cur.execute("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS qty INTEGER NOT NULL DEFAULT 1;")
+            cur.execute("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total_price INTEGER;")
+            # backfill old purchases.price -> total_price if exists
+            cur.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='purchases' AND column_name='price'
+                ) THEN
+                    UPDATE purchases SET total_price = COALESCE(total_price, price) WHERE total_price IS NULL;
+                END IF;
+            END$$;
+            """)
+            # file_stocks.delivery_text + allow file_id nullable
+            cur.execute("ALTER TABLE file_stocks ADD COLUMN IF NOT EXISTS delivery_text TEXT;")
+            cur.execute("ALTER TABLE file_stocks ALTER COLUMN file_id DROP NOT NULL;")
+            # variants remove delivery cols if they exist in some versions (ignore if missing)
+            db.commit()
+
+        # seed categories
         with db.cursor() as cur:
             cur.execute("""
                 INSERT INTO categories(name) VALUES
@@ -120,14 +138,6 @@ def exec_sql(sql, params=()):
             cur.execute(sql, params)
             db.commit()
 
-def exec_sql_returning(sql, params=()):
-    with connect() as db:
-        with db.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            rows = list(cur.fetchall())
-            db.commit()
-            return rows
-
 def set_setting(key: str, value: str):
     exec_sql("""
         INSERT INTO settings(key,value) VALUES(%s,%s)
@@ -143,3 +153,17 @@ def ensure_user(user_id: int, username: str | None):
         INSERT INTO users(user_id, username) VALUES(%s,%s)
         ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username
     """, (user_id, username))
+
+def tx_run(fn):
+    """Run function(conn) inside a transaction."""
+    conn = connect()
+    try:
+        conn.autocommit = False
+        out = fn(conn)
+        conn.commit()
+        return out
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

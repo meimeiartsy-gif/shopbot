@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
@@ -10,7 +11,7 @@ from telegram.ext import (
 
 from db import (
     ensure_schema, ensure_user, fetch_one, fetch_all, exec_sql,
-    exec_sql_returning, set_setting, get_setting
+    set_setting, get_setting, tx_run
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -19,14 +20,32 @@ log = logging.getLogger("shopbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-
 def money(n: int) -> str:
-    return f"₱{n:,}"
+    return f"₱{int(n):,}"
 
+def main_menu(uid: int) -> ReplyKeyboardMarkup:
+    if is_admin(uid):
+        return ReplyKeyboardMarkup(
+            [
+                ["🏠 Home", "🛍 Shop"],
+                ["👤 My Account", "📩 Reseller Register"],
+                ["💬 Chat Admin", "🆘 Help"],
+                ["🔐 Admin"],
+            ],
+            resize_keyboard=True
+        )
+    # customer menu (NO ADMIN)
+    return ReplyKeyboardMarkup(
+        [
+            ["🏠 Home", "🛍 Shop"],
+            ["👤 My Account", "📩 Reseller Register"],
+            ["💬 Chat Admin", "🆘 Help"],
+        ],
+        resize_keyboard=True
+    )
 
 async def safe_answer(q):
     try:
@@ -34,79 +53,41 @@ async def safe_answer(q):
     except Exception:
         pass
 
-
-# -------------------- MAIN MENU (CUSTOMERS HIDE ADMIN) --------------------
-def build_menu(uid: int) -> ReplyKeyboardMarkup:
-    rows = [
-        ["🏠 Home", "🛍 Shop"],
-        ["👤 My Account", "📩 Reseller Register"],
-        ["💬 Chat Admin", "🆘 Help"],
-    ]
-    if is_admin(uid):
-        rows.append(["🔐 Admin"])
-
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
-
-
-# ============================================================
-# SETTINGS (TEXT)
-# ============================================================
-DEFAULT_TEXT = {
-    "WELCOME_TEXT": "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:",
-    "SHOP_CATS_TEXT": "🛍 **Shop Categories**",
-    "SHOP_PRODS_TEXT": "📦 **Select a product:**",
-    "SHOP_VARIANTS_TEXT": "🧾 **Choose a package:**",
-    "NO_PRODUCTS_TEXT": "❌ No products yet in this category.",
-    "NO_VARIANTS_TEXT": "❌ No packages yet.",
-    "HELP_TEXT": (
-        "🆘 **Help**\n\n"
-        "• Tap **Shop** to browse\n"
-        "• Buy = auto delivery\n"
-        "• **Reseller Register** = apply for reseller\n"
-    ),
-    "CHAT_ADMIN_TEXT": "💬 Chat admin here:\n@lovebylunaa",
-    "CHECKOUT_TEXT": "🧾 **Checkout**\nAdjust quantity then confirm:",
-}
-
-
-# ============================================================
-# HOME / START
-# ============================================================
+# -------------------- HOME / START --------------------
 async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username)
 
-    welcome = get_setting("WELCOME_TEXT") or DEFAULT_TEXT["WELCOME_TEXT"]
-    thumb = get_setting("START_THUMB_FILE_ID")
+    welcome = get_setting("WELCOME_TEXT") or "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:"
+    thumb = get_setting("START_THUMB_FILE_ID")  # optional file_id
 
     msg = update.message if update.message else update.callback_query.message
-    menu = build_menu(user.id)
 
     if thumb:
-        await msg.reply_photo(photo=thumb, caption=welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=menu)
+        await msg.reply_photo(
+            photo=thumb,
+            caption=welcome,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(user.id)
+        )
     else:
-        await msg.reply_text(welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=menu)
-
+        await msg.reply_text(welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu(user.id))
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_home(update, context)
 
-
 async def home_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_home(update, context)
 
-
-# ============================================================
-# ACCOUNT / POINTS / BALANCE
-# ============================================================
+# -------------------- ACCOUNT --------------------
 async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username)
 
-    u = fetch_one(
-        "SELECT user_id, username, joined_at, points, is_reseller, balance FROM users WHERE user_id=%s",
-        (user.id,)
-    )
+    u = fetch_one("""
+        SELECT user_id, username, joined_at, points, is_reseller, balance
+        FROM users WHERE user_id=%s
+    """, (user.id,))
     purchases = fetch_one("SELECT COALESCE(SUM(qty),0) AS c FROM purchases WHERE user_id=%s", (user.id,))
     count = int(purchases["c"]) if purchases else 0
 
@@ -126,342 +107,457 @@ async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Balance: **{money(bal)}**\n"
         f"Reseller: **{reseller}**"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu(user.id))
 
-
-# ============================================================
-# HELP / CHAT ADMIN
-# ============================================================
+# -------------------- HELP / CHAT ADMIN --------------------
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = get_setting("HELP_TEXT") or DEFAULT_TEXT["HELP_TEXT"]
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
+    await update.message.reply_text(
+        "🆘 **Help**\n\n"
+        "• Tap **Shop** to browse\n"
+        "• Choose package → quantity → confirm\n"
+        "• Delivery is automatic after confirm\n",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(update.effective_user.id)
+    )
 
 async def chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = get_setting("CHAT_ADMIN_TEXT") or DEFAULT_TEXT["CHAT_ADMIN_TEXT"]
-    await update.message.reply_text(text)
+    admin_user = get_setting("ADMIN_USERNAME") or "@lovebylunaa"
+    await update.message.reply_text(
+        f"💬 Chat admin here:\n{admin_user}",
+        reply_markup=main_menu(update.effective_user.id)
+    )
 
-
-# ============================================================
-# SHOP UI (EDIT SAME MESSAGE; BACK DOESN'T SPAM CHAT)
-# ============================================================
+# -------------------- SHOP UI --------------------
 async def shop_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
     rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-    header = get_setting("SHOP_CATS_TEXT") or DEFAULT_TEXT["SHOP_CATS_TEXT"]
-    await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+    await update.message.reply_text(
+        "🛍 **Shop Categories**",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
 
+def shop_categories_markup():
+    cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
+    return InlineKeyboardMarkup([[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats])
 
 async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
     parts = q.data.split(":")
-    action = parts[1]
-
-    if action == "cat":
+    if parts[1] == "cat":
         cat_id = int(parts[2])
-        context.user_data["shop_cat_id"] = cat_id
-
         prods = fetch_all("""
             SELECT id,name,description FROM products
             WHERE is_active=TRUE AND category_id=%s
             ORDER BY id
         """, (cat_id,))
-
         if not prods:
-            await q.message.edit_text(
-                get_setting("NO_PRODUCTS_TEXT") or DEFAULT_TEXT["NO_PRODUCTS_TEXT"],
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="shop:back")]])
-            )
+            await q.edit_message_text("No products yet in this category.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅ Back", callback_data="shop:back:cats")]
+            ]))
             return
 
-        header = get_setting("SHOP_PRODS_TEXT") or DEFAULT_TEXT["SHOP_PRODS_TEXT"]
         rows = [[InlineKeyboardButton(p["name"], callback_data=f"shop:prod:{p['id']}")] for p in prods]
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:back")])
-
-        await q.message.edit_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:back:cats")])
+        await q.edit_message_text("Select a product:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if action == "prod":
+    if parts[1] == "prod":
         pid = int(parts[2])
         prod = fetch_one("SELECT id,name,description FROM products WHERE id=%s AND is_active=TRUE", (pid,))
         if not prod:
-            await q.message.edit_text("Product not found.")
+            await q.edit_message_text("Product not found.", reply_markup=shop_categories_markup())
             return
 
         vars_ = fetch_all("""
-            SELECT id,name,price,delivery_type FROM variants
+            SELECT id,name,price FROM variants
             WHERE product_id=%s AND is_active=TRUE
             ORDER BY id
         """, (pid,))
-
         if not vars_:
-            cat_id = context.user_data.get("shop_cat_id")
-            back_cb = f"shop:cat:{cat_id}" if cat_id else "shop:back"
-            await q.message.edit_text(
-                get_setting("NO_VARIANTS_TEXT") or DEFAULT_TEXT["NO_VARIANTS_TEXT"],
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data=back_cb)]])
-            )
+            await q.edit_message_text("No packages yet.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅ Back", callback_data="shop:back:cats")]
+            ]))
             return
-
-        header = get_setting("SHOP_VARIANTS_TEXT") or DEFAULT_TEXT["SHOP_VARIANTS_TEXT"]
 
         rows = []
         for v in vars_:
-            stock = fetch_one(
-                "SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE",
-                (v["id"],)
-            )
+            stock = fetch_one("""
+                SELECT COUNT(*) AS c
+                FROM file_stocks
+                WHERE variant_id=%s AND is_sold=FALSE
+            """, (v["id"],))
             s = int(stock["c"]) if stock else 0
             rows.append([InlineKeyboardButton(
                 f"{v['name']} — {money(int(v['price']))} (Stock: {s})",
-                callback_data=f"cart:start:{v['id']}"
+                callback_data=f"cart:pick:{v['id']}"
             )])
 
-        cat_id = context.user_data.get("shop_cat_id")
-        back_cb = f"shop:cat:{cat_id}" if cat_id else "shop:back"
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data=back_cb)])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:back:cats")])
 
-        text = f"🧾 **{prod['name']}**\n\n{prod['description']}\n\n{header}"
-        await q.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+        text = f"🧾 **{prod['name']}**\n\n{prod['description']}"
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if action == "back":
-        cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
-        rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-        header = get_setting("SHOP_CATS_TEXT") or DEFAULT_TEXT["SHOP_CATS_TEXT"]
-        await q.message.edit_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+    if parts[1] == "back":
+        # back to categories
+        await q.edit_message_text("🛍 **Shop Categories**", parse_mode=ParseMode.MARKDOWN, reply_markup=shop_categories_markup())
         return
 
-
-# ============================================================
-# CART / CHECKOUT
-# ============================================================
-def cart_kb(variant_id: int, qty: int, back_cb: str):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("➖", callback_data=f"cart:dec:{variant_id}"),
-            InlineKeyboardButton(f"Qty: {qty}", callback_data="noop"),
-            InlineKeyboardButton("➕", callback_data=f"cart:inc:{variant_id}"),
-        ],
-        [
-            InlineKeyboardButton("✅ Confirm", callback_data=f"cart:confirm:{variant_id}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cart:cancel:{variant_id}"),
-        ],
-        [InlineKeyboardButton("⬅ Back", callback_data=back_cb)],
-    ])
-
-
+# -------------------- CART FLOW (QTY -> CONFIRM -> CANCEL) --------------------
 async def cb_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-
-    parts = q.data.split(":")
-    action = parts[1]
-
-    if action == "start":
-        variant_id = int(parts[2])
-        context.user_data["cart_qty"] = 1
-        context.user_data["cart_variant_id"] = variant_id
-
-    variant_id = int(parts[2])
-    qty = int(context.user_data.get("cart_qty", 1))
-
-    if action == "inc":
-        qty += 1
-    elif action == "dec":
-        qty = max(1, qty - 1)
-    elif action == "cancel":
-        context.user_data.pop("cart_qty", None)
-        context.user_data.pop("cart_variant_id", None)
-        await q.message.edit_text("❌ Cancelled.")
-        return
-
-    context.user_data["cart_qty"] = qty
-
-    v = fetch_one("""
-        SELECT v.id, v.name, v.price, v.delivery_type,
-               p.name AS product_name
-        FROM variants v
-        JOIN products p ON p.id=v.product_id
-        WHERE v.id=%s AND v.is_active=TRUE
-    """, (variant_id,))
-    if not v:
-        await q.message.edit_text("Package not found.")
-        return
-
-    stock = fetch_one("SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE", (variant_id,))
-    s = int(stock["c"]) if stock else 0
-
-    user_id = q.from_user.id
-    u = fetch_one("SELECT balance FROM users WHERE user_id=%s", (user_id,))
-    bal = int(u["balance"]) if u else 0
-
-    total = int(v["price"]) * qty
-    checkout_text = get_setting("CHECKOUT_TEXT") or DEFAULT_TEXT["CHECKOUT_TEXT"]
-
-    cat_id = context.user_data.get("shop_cat_id")
-    back_cb = f"shop:cat:{cat_id}" if cat_id else "shop:back"
-
-    text = (
-        f"{checkout_text}\n\n"
-        f"**{v['product_name']} — {v['name']}**\n"
-        f"Price each: **{money(int(v['price']))}**\n"
-        f"Stock available: **{s}**\n"
-        f"Your balance: **{money(bal)}**\n\n"
-        f"Total: **{money(total)}**"
-    )
-
-    await q.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=cart_kb(variant_id, qty, back_cb))
-
-
-async def cb_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-
-
-# ============================================================
-# CONFIRM PURCHASE (ROLLBACK SAFE)
-# ============================================================
-async def cb_cart_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
     user = q.from_user
     ensure_user(user.id, user.username)
 
-    variant_id = int(q.data.split(":")[2])
-    qty = int(context.user_data.get("cart_qty", 1))
+    parts = q.data.split(":")
+    action = parts[1]
 
-    v = fetch_one("""
-        SELECT v.id, v.name, v.price, v.delivery_type,
-               p.name AS product_name
-        FROM variants v
-        JOIN products p ON p.id=v.product_id
-        WHERE v.id=%s AND v.is_active=TRUE
-    """, (variant_id,))
-    if not v:
-        await q.message.edit_text("Package not found.")
-        return
+    if action == "pick":
+        variant_id = int(parts[2])
+        v = fetch_one("""
+            SELECT v.id, v.name, v.price, p.name AS product_name
+            FROM variants v
+            JOIN products p ON p.id=v.product_id
+            WHERE v.id=%s AND v.is_active=TRUE
+        """, (variant_id,))
+        if not v:
+            await q.edit_message_text("Package not found.")
+            return
 
-    price_each = int(v["price"])
-    total = price_each * qty
+        stock = fetch_one("SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE", (variant_id,))
+        s = int(stock["c"]) if stock else 0
 
-    u = fetch_one("SELECT balance FROM users WHERE user_id=%s", (user.id,))
-    bal = int(u["balance"]) if u else 0
-    if bal < total:
-        await q.message.edit_text(f"❌ Not enough balance.\nNeed {money(total)}, you have {money(bal)}.")
-        return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Qty 1", callback_data=f"cart:qty:{variant_id}:1"),
+             InlineKeyboardButton("Qty 2", callback_data=f"cart:qty:{variant_id}:2")],
+            [InlineKeyboardButton("Qty 5", callback_data=f"cart:qty:{variant_id}:5"),
+             InlineKeyboardButton("Qty 10", callback_data=f"cart:qty:{variant_id}:10")],
+            [InlineKeyboardButton("⬅ Back", callback_data="shop:back:cats")]
+        ])
 
-    # Pick stocks and mark sold
-    picked = exec_sql_returning("""
-        WITH picked AS (
-            SELECT id, file_id, delivery_text
-            FROM file_stocks
-            WHERE variant_id=%s AND is_sold=FALSE
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT %s
+        await q.edit_message_text(
+            f"🛒 **{v['product_name']}**\n"
+            f"Package: **{v['name']}**\n"
+            f"Price each: **{money(int(v['price']))}**\n"
+            f"Available stock: **{s}**\n\n"
+            f"Choose quantity:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb
         )
-        UPDATE file_stocks s
-        SET is_sold=TRUE, sold_to=%s, sold_at=NOW()
-        FROM picked
-        WHERE s.id = picked.id
-        RETURNING picked.id, picked.file_id, picked.delivery_text;
-    """, (variant_id, qty, user.id))
-
-    if len(picked) < qty:
-        await q.message.edit_text("❌ Not enough stock. Please reduce quantity.")
         return
 
-    purchase_id = None
-    stock_ids = [int(r["id"]) for r in picked]
+    if action == "qty":
+        variant_id = int(parts[2])
+        qty = int(parts[3])
 
-    try:
-        # Deduct balance + record purchase
-        exec_sql("UPDATE users SET balance = balance - %s, points = points + %s WHERE user_id=%s", (total, qty, user.id))
+        v = fetch_one("""
+            SELECT v.id, v.name, v.price, p.name AS product_name
+            FROM variants v
+            JOIN products p ON p.id=v.product_id
+            WHERE v.id=%s AND v.is_active=TRUE
+        """, (variant_id,))
+        if not v:
+            await q.edit_message_text("Package not found.")
+            return
 
-        row = exec_sql_returning(
-            "INSERT INTO purchases(user_id, variant_id, qty, price_each, total_price) VALUES(%s,%s,%s,%s,%s) RETURNING id",
-            (user.id, variant_id, qty, price_each, total)
+        stock = fetch_one("SELECT COUNT(*) AS c FROM file_stocks WHERE variant_id=%s AND is_sold=FALSE", (variant_id,))
+        s = int(stock["c"]) if stock else 0
+
+        total = int(v["price"]) * qty
+        u = fetch_one("SELECT balance FROM users WHERE user_id=%s", (user.id,))
+        bal = int(u["balance"]) if u else 0
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm", callback_data=f"cart:confirm:{variant_id}:{qty}"),
+             InlineKeyboardButton("❌ Cancel", callback_data="cart:cancel")],
+            [InlineKeyboardButton("⬅ Back", callback_data=f"cart:pick:{variant_id}")]
+        ])
+
+        await q.edit_message_text(
+            f"✅ **Confirm Order**\n\n"
+            f"Product: **{v['product_name']}**\n"
+            f"Package: **{v['name']}**\n"
+            f"Qty: **{qty}**\n"
+            f"Total: **{money(total)}**\n"
+            f"Your balance: **{money(bal)}**\n"
+            f"Stock available: **{s}**",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb
         )
-        purchase_id = int(row[0]["id"])
+        return
 
-        # Deliver
-        if (v["delivery_type"] or "").lower() == "file":
-            for r in picked:
-                if not r["file_id"]:
-                    raise RuntimeError("Missing file_id in stock row")
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=r["file_id"],
-                    caption=f"✅ Delivery: {v['product_name']} — {v['name']}\nPrice: {money(price_each)}"
-                )
-        else:
-            for r in picked:
-                payload = (r["delivery_text"] or "").strip()
-                if not payload:
-                    raise RuntimeError("Missing delivery_text in stock row")
+    if action == "cancel":
+        await q.edit_message_text("❌ Order cancelled.", reply_markup=shop_categories_markup())
+        return
+
+    if action == "confirm":
+        variant_id = int(parts[2])
+        qty = int(parts[3])
+
+        # transactional confirm: check balance + lock stock rows, then mark sold, deduct, deliver
+        def do_confirm(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # load variant
+                cur.execute("""
+                    SELECT v.id, v.name, v.price, p.name AS product_name
+                    FROM variants v
+                    JOIN products p ON p.id=v.product_id
+                    WHERE v.id=%s AND v.is_active=TRUE
+                """, (variant_id,))
+                v = cur.fetchone()
+                if not v:
+                    return ("ERR", "Package not found.", None)
+
+                total = int(v["price"]) * qty
+
+                # balance lock
+                cur.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (user.id,))
+                row = cur.fetchone()
+                bal = int(row["balance"]) if row else 0
+                if bal < total:
+                    return ("ERR", f"❌ Not enough balance.\nNeed {money(total)}, you have {money(bal)}.", None)
+
+                # lock stock rows
+                cur.execute("""
+                    SELECT id, file_id, delivery_text
+                    FROM file_stocks
+                    WHERE variant_id=%s AND is_sold=FALSE
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                """, (variant_id, qty))
+                stocks = cur.fetchall()
+                if len(stocks) < qty:
+                    return ("ERR", "❌ Not enough stock. Please reduce quantity.", None)
+
+                # deduct balance
+                cur.execute("UPDATE users SET balance = balance - %s, points = points + %s WHERE user_id=%s",
+                            (total, qty, user.id))
+
+                # mark sold
+                ids = [s["id"] for s in stocks]
+                cur.execute("""
+                    UPDATE file_stocks
+                    SET is_sold=TRUE, sold_to=%s, sold_at=NOW()
+                    WHERE id = ANY(%s)
+                """, (user.id, ids))
+
+                # purchase record
+                cur.execute("""
+                    INSERT INTO purchases(user_id, variant_id, qty, total_price)
+                    VALUES(%s,%s,%s,%s)
+                """, (user.id, variant_id, qty, total))
+
+                return ("OK", f"✅ Paid {money(total)} — delivering now...", {"variant": v, "stocks": stocks, "total": total})
+
+        status, msg, payload = tx_run(do_confirm)
+        if status != "OK":
+            await q.message.reply_text(msg, reply_markup=main_menu(user.id))
+            # keep screen
+            return
+
+        # show paid message (edit the confirm screen)
+        await q.edit_message_text(msg)
+
+        v = payload["variant"]
+        stocks = payload["stocks"]
+
+        # deliver each stock row
+        delivered = 0
+        for s in stocks:
+            if s.get("delivery_text"):
                 await context.bot.send_message(
                     chat_id=user.id,
-                    text=f"✅ Delivery: {v['product_name']} — {v['name']}\nPrice: {money(price_each)}\n\n`{payload}`",
+                    text=f"✅ **Delivery**: {v['product_name']} — {v['name']}\n\n`{s['delivery_text']}`",
                     parse_mode=ParseMode.MARKDOWN
                 )
+                delivered += 1
+            elif s.get("file_id"):
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=s["file_id"],
+                    caption=f"✅ Delivery: {v['product_name']} — {v['name']}"
+                )
+                delivered += 1
 
-        # success
-        context.user_data.pop("cart_qty", None)
-        context.user_data.pop("cart_variant_id", None)
-        await q.message.edit_text(f"✅ Purchased **{qty}** and delivered!\nTotal: {money(total)}",
-                                  parse_mode=ParseMode.MARKDOWN)
-
-    except Exception as e:
-        log.exception("Delivery failed, rolling back: %s", e)
-
-        # ROLLBACK: restore stocks
-        exec_sql(
-            "UPDATE file_stocks SET is_sold=FALSE, sold_to=NULL, sold_at=NULL WHERE id = ANY(%s)",
-            (stock_ids,)
+        await q.message.reply_text(
+            f"✅ Done! Delivered **{delivered}** item(s).",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(user.id)
         )
+        return
 
-        # refund balance/points
-        exec_sql("UPDATE users SET balance = balance + %s, points = GREATEST(points - %s, 0) WHERE user_id=%s",
-                 (total, qty, user.id))
+# -------------------- RESELLER REGISTRATION FORM --------------------
+async def reseller_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["reseller_step"] = 1
+    await update.message.reply_text(
+        "📩 **Reseller Registration**\n\nSend your **Full Name**:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(update.effective_user.id)
+    )
 
-        # delete purchase
-        if purchase_id:
-            exec_sql("DELETE FROM purchases WHERE id=%s", (purchase_id,))
+async def reseller_form_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "reseller_step" not in context.user_data:
+        return
 
-        await q.message.edit_text("❌ Delivery failed. Your balance & stock were restored.\nTry again.")
+    step = context.user_data["reseller_step"]
+    text = update.message.text.strip()
 
+    if step == 1:
+        context.user_data["res_full_name"] = text
+        context.user_data["reseller_step"] = 2
+        await update.message.reply_text("Send your **Contact** (Telegram/FB/etc):", parse_mode=ParseMode.MARKDOWN)
+        return
 
-# ============================================================
-# ADMIN COMMANDS
-# ============================================================
+    if step == 2:
+        context.user_data["res_contact"] = text
+        context.user_data["reseller_step"] = 3
+        await update.message.reply_text("Send your **Shop Link** (FB page / Telegram channel / etc):", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if step == 3:
+        user = update.effective_user
+        full_name = context.user_data.pop("res_full_name")
+        contact = context.user_data.pop("res_contact")
+        shop_link = text
+        context.user_data.pop("reseller_step", None)
+
+        exec_sql("""
+            INSERT INTO reseller_applications(user_id, username, full_name, contact, shop_link)
+            VALUES(%s,%s,%s,%s,%s)
+        """, (user.id, user.username, full_name, contact, shop_link))
+
+        await update.message.reply_text("✅ Submitted! Waiting for admin approval 💗", reply_markup=main_menu(user.id))
+
+        for admin_id in ADMIN_IDS:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"admin:res:approve:{user.id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"admin:res:reject:{user.id}")
+            ]])
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "📩 New Reseller Application\n\n"
+                    f"User: @{user.username} (`{user.id}`)\n"
+                    f"Name: {full_name}\n"
+                    f"Contact: {contact}\n"
+                    f"Shop: {shop_link}"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb
+            )
+
+# -------------------- ADMIN (approve/reject reseller) --------------------
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Access denied.")
+        await update.message.reply_text("❌ Access denied.", reply_markup=main_menu(update.effective_user.id))
         return
-    await update.message.reply_text("🔐 Admin ready ✅")
+    await update.message.reply_text(
+        "🔐 Admin ready ✅\n\nAdmin commands:\n"
+        "• /setwelcome <text>\n"
+        "• /setthumb (then send photo)\n"
+        "• /fileid (then send file/photo)\n\n"
+        "SQL only adding products/stocks is OK ✅",
+        reply_markup=main_menu(update.effective_user.id)
+    )
 
+async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
 
-async def addbal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(q.from_user.id):
+        await q.message.reply_text("❌ Access denied.", reply_markup=main_menu(q.from_user.id))
+        return
+
+    data = q.data.split(":")
+    if data[1] == "res":
+        action = data[2]
+        uid = int(data[3])
+
+        if action == "approve":
+            exec_sql("UPDATE users SET is_reseller=TRUE WHERE user_id=%s", (uid,))
+            exec_sql("""
+                UPDATE reseller_applications
+                SET status='APPROVED', decided_at=NOW(), admin_id=%s
+                WHERE user_id=%s AND status='PENDING'
+            """, (q.from_user.id, uid))
+            await context.bot.send_message(uid, "✅ Your reseller application is APPROVED! 💗")
+            await q.message.reply_text("✅ Approved.")
+            return
+
+        if action == "reject":
+            exec_sql("""
+                UPDATE reseller_applications
+                SET status='REJECTED', decided_at=NOW(), admin_id=%s
+                WHERE user_id=%s AND status='PENDING'
+            """, (q.from_user.id, uid))
+            await context.bot.send_message(uid, "❌ Your reseller application was rejected.")
+            await q.message.reply_text("❌ Rejected.")
+            return
+
+# -------------------- ADMIN: welcome + start thumb --------------------
+async def setwelcome_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
         return
-    parts = update.message.text.strip().split()
-    if len(parts) != 3:
-        await update.message.reply_text("Usage: /addbal <user_id> <amount>")
+    txt = update.message.text.replace("/setwelcome", "", 1).strip()
+    if not txt:
+        await update.message.reply_text("Usage: /setwelcome <text>", reply_markup=main_menu(update.effective_user.id))
         return
-    uid = int(parts[1])
-    amt = int(parts[2])
-    exec_sql("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amt, uid))
-    await update.message.reply_text(f"✅ Added {money(amt)} to `{uid}`", parse_mode=ParseMode.MARKDOWN)
+    set_setting("WELCOME_TEXT", txt)
+    await update.message.reply_text("✅ Welcome text updated!", reply_markup=main_menu(update.effective_user.id))
 
+async def setthumb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    context.user_data["await_thumb"] = True
+    await update.message.reply_text("Send the thumbnail photo now (as PHOTO).", reply_markup=main_menu(update.effective_user.id))
 
-# ============================================================
-# BOOT
-# ============================================================
+async def capture_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.user_data.get("await_thumb"):
+        return
+    if not update.message.photo:
+        await update.message.reply_text("Send as PHOTO please.", reply_markup=main_menu(update.effective_user.id))
+        return
+    file_id = update.message.photo[-1].file_id
+    set_setting("START_THUMB_FILE_ID", file_id)
+    context.user_data["await_thumb"] = False
+    await update.message.reply_text("✅ Start thumbnail saved!", reply_markup=main_menu(update.effective_user.id))
+
+# -------------------- /fileid helper --------------------
+async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    context.user_data["await_fileid"] = True
+    await update.message.reply_text("Send the FILE (document) or PHOTO now. I will reply with file_id.", reply_markup=main_menu(update.effective_user.id))
+
+async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.user_data.get("await_fileid"):
+        return
+
+    fid = None
+    if update.message.document:
+        fid = update.message.document.file_id
+    elif update.message.photo:
+        fid = update.message.photo[-1].file_id
+
+    if not fid:
+        await update.message.reply_text("Send a document or photo.", reply_markup=main_menu(update.effective_user.id))
+        return
+
+    context.user_data["await_fileid"] = False
+    await update.message.reply_text(f"✅ file_id:\n`{fid}`", parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu(update.effective_user.id))
+
+# -------------------- BOOT --------------------
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing")
@@ -471,23 +567,34 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("addbal", addbal_cmd))
 
+    # Admin
+    app.add_handler(CommandHandler("setwelcome", setwelcome_cmd))
+    app.add_handler(CommandHandler("setthumb", setthumb_cmd))
+    app.add_handler(CommandHandler("fileid", fileid_cmd))
+
+    # Menu buttons
     app.add_handler(MessageHandler(filters.Regex(r"^🏠 Home$"), home_btn))
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Shop$"), shop_btn))
     app.add_handler(MessageHandler(filters.Regex(r"^👤 My Account$"), my_account))
-    app.add_handler(MessageHandler(filters.Regex(r"^📩 Reseller Register$"), lambda u, c: None))
+    app.add_handler(MessageHandler(filters.Regex(r"^📩 Reseller Register$"), reseller_register))
     app.add_handler(MessageHandler(filters.Regex(r"^💬 Chat Admin$"), chat_admin))
     app.add_handler(MessageHandler(filters.Regex(r"^🆘 Help$"), help_cmd))
     app.add_handler(MessageHandler(filters.Regex(r"^🔐 Admin$"), admin_cmd))
 
+    # Callbacks
     app.add_handler(CallbackQueryHandler(cb_shop, pattern=r"^shop:"))
-    app.add_handler(CallbackQueryHandler(cb_cart, pattern=r"^cart:(start|inc|dec|cancel):"))
-    app.add_handler(CallbackQueryHandler(cb_cart_confirm, pattern=r"^cart:confirm:"))
-    app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
+    app.add_handler(CallbackQueryHandler(cb_cart, pattern=r"^cart:"))
+    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin:"))
+
+    # Admin captures
+    app.add_handler(MessageHandler(filters.PHOTO, capture_thumb))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, capture_fileid))
+
+    # Reseller form steps
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reseller_form_text))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
