@@ -1,6 +1,5 @@
 import os
 import logging
-from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
@@ -20,6 +19,7 @@ log = logging.getLogger("shopbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
+# -------------------- MAIN MENU (PERMANENT KEYBOARD) --------------------
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["🏠 Home", "🛍 Shop"],
@@ -42,18 +42,58 @@ async def safe_answer(q):
     except Exception:
         pass
 
-# -------------------- HOME / START --------------------
+
+# ============================================================
+# SETTINGS (TEXT + THUMBNAILS)
+# ============================================================
+TEXT_KEYS = {
+    "WELCOME_TEXT": "Welcome / Home text",
+    "SHOP_CATS_TEXT": "Shop: Categories header",
+    "SHOP_PRODS_TEXT": "Shop: Products header",
+    "SHOP_VARIANTS_TEXT": "Shop: Packages header",
+    "NO_PRODUCTS_TEXT": "Shop: No products text",
+    "NO_VARIANTS_TEXT": "Shop: No packages text",
+    "HELP_TEXT": "Help text",
+    "CHAT_ADMIN_TEXT": "Chat Admin text",
+    "ADMIN_PANEL_TEXT": "Admin panel intro text",
+}
+
+THUMB_KEYS = {
+    "START_THUMB_FILE_ID": "Start/Home thumbnail",
+    "SHOP_THUMB_FILE_ID": "Shop thumbnail",
+    "HELP_THUMB_FILE_ID": "Help thumbnail",
+    "ADMIN_THUMB_FILE_ID": "Admin thumbnail",
+}
+
+DEFAULT_TEXT = {
+    "WELCOME_TEXT": "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:",
+    "SHOP_CATS_TEXT": "🛍 **Shop Categories**",
+    "SHOP_PRODS_TEXT": "📦 **Select a product:**",
+    "SHOP_VARIANTS_TEXT": "🧾 **Choose a package:**",
+    "NO_PRODUCTS_TEXT": "❌ No products yet in this category.",
+    "NO_VARIANTS_TEXT": "❌ No packages yet.",
+    "HELP_TEXT": (
+        "🆘 **Help**\n\n"
+        "• Tap **Shop** to browse\n"
+        "• Buy = auto delivery\n"
+        "• **Reseller Register** = apply for reseller\n"
+    ),
+    "CHAT_ADMIN_TEXT": "💬 Chat admin here:\n@lovebylunaa",
+    "ADMIN_PANEL_TEXT": "🔐 **Admin Panel**\nChoose what you want to edit:",
+}
+
+
+# ============================================================
+# HOME / START
+# ============================================================
 async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username)
 
-    welcome = get_setting("WELCOME_TEXT") or "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:"
-    thumb = get_setting("START_THUMB_FILE_ID")  # optional
+    welcome = get_setting("WELCOME_TEXT") or DEFAULT_TEXT["WELCOME_TEXT"]
+    thumb = get_setting("START_THUMB_FILE_ID")
 
-    if update.message:
-        msg = update.message
-    else:
-        msg = update.callback_query.message
+    msg = update.message if update.message else update.callback_query.message
 
     if thumb:
         await msg.reply_photo(
@@ -71,7 +111,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def home_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_home(update, context)
 
-# -------------------- ACCOUNT / POINTS --------------------
+
+# ============================================================
+# ACCOUNT / POINTS
+# ============================================================
 async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username)
@@ -96,58 +139,86 @@ async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-# -------------------- HELP / CHAT ADMIN --------------------
+
+# ============================================================
+# HELP / CHAT ADMIN
+# ============================================================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🆘 **Help**\n\n"
-        "• Tap **Shop** to browse\n"
-        "• Buy = auto delivery\n"
-        "• **Reseller Register** = apply for reseller\n",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    text = get_setting("HELP_TEXT") or DEFAULT_TEXT["HELP_TEXT"]
+    thumb = get_setting("HELP_THUMB_FILE_ID")
+
+    if thumb:
+        await update.message.reply_photo(photo=thumb, caption=text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_user = get_setting("ADMIN_USERNAME") or "@lovebylunaa"
-    await update.message.reply_text(
-        f"💬 Chat admin here:\n{admin_user}"
-    )
+    text = get_setting("CHAT_ADMIN_TEXT") or DEFAULT_TEXT["CHAT_ADMIN_TEXT"]
+    await update.message.reply_text(text)
 
-# -------------------- SHOP UI --------------------
+
+# ============================================================
+# SHOP UI (CLEAN BACK = EDIT SAME MESSAGE)
+# ============================================================
 async def shop_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
     rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-    await update.message.reply_text(
-        "🛍 **Shop Categories**",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(rows)
-    )
+
+    header = get_setting("SHOP_CATS_TEXT") or DEFAULT_TEXT["SHOP_CATS_TEXT"]
+    thumb = get_setting("SHOP_THUMB_FILE_ID")
+
+    if thumb:
+        await update.message.reply_photo(
+            photo=thumb,
+            caption=header,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+    else:
+        await update.message.reply_text(
+            header,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
 
 async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
     parts = q.data.split(":")
-    if parts[1] == "cat":
+    action = parts[1]
+
+    if action == "cat":
         cat_id = int(parts[2])
+        context.user_data["shop_cat_id"] = cat_id
+
         prods = fetch_all("""
             SELECT id,name,description FROM products
             WHERE is_active=TRUE AND category_id=%s
             ORDER BY id
         """, (cat_id,))
+
         if not prods:
-            await q.edit_message_text("No products yet in this category.")
+            await q.message.edit_text(
+                get_setting("NO_PRODUCTS_TEXT") or DEFAULT_TEXT["NO_PRODUCTS_TEXT"],
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅ Back", callback_data="shop:back")]
+                ])
+            )
             return
 
+        header = get_setting("SHOP_PRODS_TEXT") or DEFAULT_TEXT["SHOP_PRODS_TEXT"]
         rows = [[InlineKeyboardButton(p["name"], callback_data=f"shop:prod:{p['id']}")] for p in prods]
         rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:back")])
-        await q.edit_message_text("Select a product:", reply_markup=InlineKeyboardMarkup(rows))
+
+        await q.message.edit_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if parts[1] == "prod":
+    if action == "prod":
         pid = int(parts[2])
         prod = fetch_one("SELECT id,name,description FROM products WHERE id=%s AND is_active=TRUE", (pid,))
         if not prod:
-            await q.edit_message_text("Product not found.")
+            await q.message.edit_text("Product not found.")
             return
 
         vars_ = fetch_all("""
@@ -155,9 +226,18 @@ async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE product_id=%s AND is_active=TRUE
             ORDER BY id
         """, (pid,))
+
         if not vars_:
-            await q.edit_message_text("No packages yet.")
+            # back to products list
+            cat_id = context.user_data.get("shop_cat_id")
+            back_cb = f"shop:cat:{cat_id}" if cat_id else "shop:back"
+            await q.message.edit_text(
+                get_setting("NO_VARIANTS_TEXT") or DEFAULT_TEXT["NO_VARIANTS_TEXT"],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data=back_cb)]])
+            )
             return
+
+        header = get_setting("SHOP_VARIANTS_TEXT") or DEFAULT_TEXT["SHOP_VARIANTS_TEXT"]
 
         rows = []
         for v in vars_:
@@ -168,20 +248,26 @@ async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"buy:{v['id']}"
             )])
 
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data="shop:back")])
+        # back to product list
+        cat_id = context.user_data.get("shop_cat_id")
+        back_cb = f"shop:cat:{cat_id}" if cat_id else "shop:back"
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data=back_cb)])
 
-        text = f"🧾 **{prod['name']}**\n\n{prod['description']}"
-        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+        text = f"🧾 **{prod['name']}**\n\n{prod['description']}\n\n{header}"
+        await q.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if parts[1] == "back":
-        # back to categories
+    if action == "back":
         cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
         rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-        await q.edit_message_text("🛍 **Shop Categories**", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+        header = get_setting("SHOP_CATS_TEXT") or DEFAULT_TEXT["SHOP_CATS_TEXT"]
+        await q.message.edit_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
         return
 
-# -------------------- BUY + AUTO DELIVERY (NO DOUBLE) --------------------
+
+# ============================================================
+# BUY + AUTO DELIVERY
+# ============================================================
 async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
@@ -191,7 +277,7 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     variant_id = int(q.data.split(":")[1])
     v = fetch_one("""
-        SELECT v.id, v.name, v.price, v.delivery_type, v.delivery_file_id, v.delivery_text,
+        SELECT v.id, v.name, v.price,
                p.name AS product_name
         FROM variants v
         JOIN products p ON p.id=v.product_id
@@ -201,7 +287,6 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Package not found.")
         return
 
-    # Take 1 file stock row and lock it (safe)
     with_row = fetch_one("""
         SELECT id, file_id FROM file_stocks
         WHERE variant_id=%s AND is_sold=FALSE
@@ -213,19 +298,14 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     price = int(v["price"])
-
-    # For now: no balance system in this snippet (you can add it back later)
-    # Auto deliver:
     stock_id = int(with_row["id"])
     file_id = with_row["file_id"]
 
-    # Mark sold first (prevents double delivery)
     exec_sql("""
         UPDATE file_stocks SET is_sold=TRUE, sold_to=%s, sold_at=NOW()
         WHERE id=%s AND is_sold=FALSE
     """, (user.id, stock_id))
 
-    # Save purchase + points
     exec_sql("INSERT INTO purchases(user_id, variant_id, price) VALUES(%s,%s,%s)", (user.id, variant_id, price))
     exec_sql("UPDATE users SET points=points+1 WHERE user_id=%s", (user.id,))
 
@@ -236,12 +316,26 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await q.message.reply_text("✅ Purchase delivered!")
 
-# -------------------- RESELLER REGISTRATION FORM --------------------
+
+# ============================================================
+# RESELLER REGISTRATION FORM + ADMIN EDIT TEXT MODE
+# ============================================================
 async def reseller_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["reseller_step"] = 1
-    await update.message.reply_text("📩 **Reseller Registration**\n\nSend your **Full Name**:", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "📩 **Reseller Registration**\n\nSend your **Full Name**:",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def reseller_form_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ADMIN TEXT EDIT MODE
+    if context.user_data.get("edit_text_key"):
+        key = context.user_data.pop("edit_text_key")
+        set_setting(key, update.message.text.strip())
+        await update.message.reply_text(f"✅ Updated: {TEXT_KEYS.get(key, key)}")
+        return
+
+    # RESELLER FORM MODE
     if "reseller_step" not in context.user_data:
         return
 
@@ -274,7 +368,6 @@ async def reseller_form_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await update.message.reply_text("✅ Submitted! Waiting for admin approval 💗")
 
-        # notify admin
         for admin_id in ADMIN_IDS:
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Approve", callback_data=f"admin:res:approve:{user.id}"),
@@ -293,13 +386,107 @@ async def reseller_form_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 reply_markup=kb
             )
 
-# -------------------- ADMIN (basic approve/reject reseller) --------------------
+
+# ============================================================
+# ADMIN PANEL (EDIT TEXTS + SET THUMBNAILS)
+# ============================================================
+def admin_panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Edit Texts", callback_data="adminpanel:texts")],
+        [InlineKeyboardButton("🖼 Set Thumbnails", callback_data="adminpanel:thumbs")],
+        [InlineKeyboardButton("⬅ Close", callback_data="adminpanel:close")],
+    ])
+
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Access denied.")
         return
-    await update.message.reply_text("🔐 Admin ready ✅\n\n(Next: product add/edit/delete panel)")
 
+    text = get_setting("ADMIN_PANEL_TEXT") or DEFAULT_TEXT["ADMIN_PANEL_TEXT"]
+    thumb = get_setting("ADMIN_THUMB_FILE_ID")
+
+    if thumb:
+        await update.message.reply_photo(photo=thumb, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_panel_kb())
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_panel_kb())
+
+async def cb_adminpanel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
+
+    if not is_admin(q.from_user.id):
+        await q.message.reply_text("❌ Access denied.")
+        return
+
+    parts = q.data.split(":")
+    action = parts[1]
+
+    if action == "texts":
+        rows = []
+        for key, label in TEXT_KEYS.items():
+            rows.append([InlineKeyboardButton(label, callback_data=f"adminpanel:settext:{key}")])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="adminpanel:back")])
+        await q.message.edit_text("✏️ Choose text to edit:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if action == "settext":
+        key = parts[2]
+        context.user_data["edit_text_key"] = key
+        current = get_setting(key) or DEFAULT_TEXT.get(key, "")
+        await q.message.edit_text(
+            f"✏️ Editing: **{TEXT_KEYS.get(key, key)}**\n\nCurrent:\n{current}\n\nSend the new text now:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if action == "thumbs":
+        rows = []
+        for key, label in THUMB_KEYS.items():
+            rows.append([InlineKeyboardButton(label, callback_data=f"adminpanel:setthumb:{key}")])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="adminpanel:back")])
+        await q.message.edit_text("🖼 Choose thumbnail to set:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if action == "setthumb":
+        key = parts[2]
+        context.user_data["await_thumb_key"] = key
+        await q.message.edit_text(
+            f"🖼 Send the PHOTO now for:\n**{THUMB_KEYS.get(key, key)}**",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if action == "back":
+        text = get_setting("ADMIN_PANEL_TEXT") or DEFAULT_TEXT["ADMIN_PANEL_TEXT"]
+        await q.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_panel_kb())
+        return
+
+    if action == "close":
+        await q.message.edit_text("✅ Closed.")
+        return
+
+
+async def capture_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    key = context.user_data.get("await_thumb_key")
+    if not key:
+        return
+
+    if not update.message.photo:
+        await update.message.reply_text("Send as PHOTO please.")
+        return
+
+    file_id = update.message.photo[-1].file_id
+    set_setting(key, file_id)
+    context.user_data.pop("await_thumb_key", None)
+    await update.message.reply_text(f"✅ Thumbnail saved: {THUMB_KEYS.get(key, key)}")
+
+
+# ============================================================
+# ADMIN: approve/reject reseller
+# ============================================================
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
@@ -309,7 +496,9 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = q.data.split(":")
-    # admin:res:approve:<user_id>
+    if len(data) < 4:
+        return
+
     if data[1] == "res":
         action = data[2]
         uid = int(data[3])
@@ -335,37 +524,10 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("❌ Rejected.")
             return
 
-# -------------------- ADMIN: editable welcome + start thumb --------------------
-async def setwelcome_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    txt = update.message.text.replace("/setwelcome", "", 1).strip()
-    if not txt:
-        await update.message.reply_text("Usage: /setwelcome <text>")
-        return
-    set_setting("WELCOME_TEXT", txt)
-    await update.message.reply_text("✅ Welcome text updated!")
 
-async def setthumb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    await update.message.reply_text("Send the thumbnail photo now (as PHOTO).")
-    context.user_data["await_thumb"] = True
-
-async def capture_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.user_data.get("await_thumb"):
-        return
-    if not update.message.photo:
-        await update.message.reply_text("Send as PHOTO please.")
-        return
-    file_id = update.message.photo[-1].file_id
-    set_setting("START_THUMB_FILE_ID", file_id)
-    context.user_data["await_thumb"] = False
-    await update.message.reply_text("✅ Start thumbnail saved!")
-
-# -------------------- BOOT --------------------
+# ============================================================
+# BOOT
+# ============================================================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing")
@@ -375,10 +537,6 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
-
-    # Admin setup
-    app.add_handler(CommandHandler("setwelcome", setwelcome_cmd))
-    app.add_handler(CommandHandler("setthumb", setthumb_cmd))
 
     # Menu buttons
     app.add_handler(MessageHandler(filters.Regex(r"^🏠 Home$"), home_btn))
@@ -393,12 +551,13 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_shop, pattern=r"^shop:"))
     app.add_handler(CallbackQueryHandler(cb_buy, pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(cb_adminpanel, pattern=r"^adminpanel:"))
 
-    # Admin photo capture for thumb
+    # Admin photo capture for thumbnails
     app.add_handler(MessageHandler(filters.PHOTO, capture_thumb))
 
-    # Reseller form steps
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reseller_form_text))
+    # Text handler (reseller form + admin edit texts)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
