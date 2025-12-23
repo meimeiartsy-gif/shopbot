@@ -16,7 +16,8 @@ def ensure_schema():
         username TEXT,
         joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
         points INTEGER NOT NULL DEFAULT 0,
-        is_reseller BOOLEAN NOT NULL DEFAULT FALSE
+        is_reseller BOOLEAN NOT NULL DEFAULT FALSE,
+        balance INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -43,7 +44,7 @@ def ensure_schema():
         name TEXT NOT NULL,
         price INTEGER NOT NULL DEFAULT 0,
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        delivery_type TEXT NOT NULL DEFAULT 'file', -- 'file' or 'text'
+        delivery_type TEXT NOT NULL DEFAULT 'text', -- 'file' or 'text'
         delivery_file_id TEXT,
         delivery_text TEXT NOT NULL DEFAULT ''
     );
@@ -51,17 +52,25 @@ def ensure_schema():
     CREATE TABLE IF NOT EXISTS file_stocks (
         id SERIAL PRIMARY KEY,
         variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
-        file_id TEXT NOT NULL,
+        file_id TEXT,
+        delivery_text TEXT,
         is_sold BOOLEAN NOT NULL DEFAULT FALSE,
         sold_to BIGINT,
-        sold_at TIMESTAMP
+        sold_at TIMESTAMP,
+        CONSTRAINT file_stocks_payload_chk CHECK (
+          (file_id IS NOT NULL AND length(file_id) > 0)
+          OR
+          (delivery_text IS NOT NULL AND length(delivery_text) > 0)
+        )
     );
 
     CREATE TABLE IF NOT EXISTS purchases (
         id SERIAL PRIMARY KEY,
         user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
         variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE RESTRICT,
-        price INTEGER NOT NULL,
+        qty INTEGER NOT NULL DEFAULT 1,
+        price_each INTEGER NOT NULL,
+        total_price INTEGER NOT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
 
@@ -72,7 +81,7 @@ def ensure_schema():
         full_name TEXT NOT NULL,
         contact TEXT NOT NULL,
         shop_link TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/REJECTED
+        status TEXT NOT NULL DEFAULT 'PENDING',
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
         decided_at TIMESTAMP,
         admin_id BIGINT
@@ -110,6 +119,14 @@ def exec_sql(sql, params=()):
         with db.cursor() as cur:
             cur.execute(sql, params)
             db.commit()
+
+def exec_sql_returning(sql, params=()):
+    with connect() as db:
+        with db.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = list(cur.fetchall())
+            db.commit()
+            return rows
 
 def set_setting(key: str, value: str):
     exec_sql("""
