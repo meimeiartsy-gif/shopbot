@@ -19,23 +19,14 @@ log = logging.getLogger("shopbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-# -------------------- MAIN MENU (PERMANENT KEYBOARD) --------------------
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["🏠 Home", "🛍 Shop"],
-        ["👤 My Account", "📩 Reseller Register"],
-        ["💬 Chat Admin", "🆘 Help"],
-        ["🔐 Admin"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True
-)
 
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
+
 def money(n: int) -> str:
     return f"₱{n:,}"
+
 
 async def safe_answer(q):
     try:
@@ -43,29 +34,23 @@ async def safe_answer(q):
     except Exception:
         pass
 
-# ============================================================
-# SETTINGS (TEXT + THUMBNAILS)
-# ============================================================
-TEXT_KEYS = {
-    "WELCOME_TEXT": "Welcome / Home text",
-    "SHOP_CATS_TEXT": "Shop: Categories header",
-    "SHOP_PRODS_TEXT": "Shop: Products header",
-    "SHOP_VARIANTS_TEXT": "Shop: Packages header",
-    "NO_PRODUCTS_TEXT": "Shop: No products text",
-    "NO_VARIANTS_TEXT": "Shop: No packages text",
-    "HELP_TEXT": "Help text",
-    "CHAT_ADMIN_TEXT": "Chat Admin text",
-    "ADMIN_PANEL_TEXT": "Admin panel intro text",
-    "CHECKOUT_TEXT": "Checkout text",
-}
 
-THUMB_KEYS = {
-    "START_THUMB_FILE_ID": "Start/Home thumbnail",
-    "SHOP_THUMB_FILE_ID": "Shop thumbnail",
-    "HELP_THUMB_FILE_ID": "Help thumbnail",
-    "ADMIN_THUMB_FILE_ID": "Admin thumbnail",
-}
+# -------------------- MAIN MENU (CUSTOMERS HIDE ADMIN) --------------------
+def build_menu(uid: int) -> ReplyKeyboardMarkup:
+    rows = [
+        ["🏠 Home", "🛍 Shop"],
+        ["👤 My Account", "📩 Reseller Register"],
+        ["💬 Chat Admin", "🆘 Help"],
+    ]
+    if is_admin(uid):
+        rows.append(["🔐 Admin"])
 
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+# ============================================================
+# SETTINGS (TEXT)
+# ============================================================
 DEFAULT_TEXT = {
     "WELCOME_TEXT": "Welcome to **Luna’s Prem Shop** 💗\n\nChoose an option below:",
     "SHOP_CATS_TEXT": "🛍 **Shop Categories**",
@@ -80,9 +65,9 @@ DEFAULT_TEXT = {
         "• **Reseller Register** = apply for reseller\n"
     ),
     "CHAT_ADMIN_TEXT": "💬 Chat admin here:\n@lovebylunaa",
-    "ADMIN_PANEL_TEXT": "🔐 **Admin Panel**\nChoose what you want to edit:",
     "CHECKOUT_TEXT": "🧾 **Checkout**\nAdjust quantity then confirm:",
 }
+
 
 # ============================================================
 # HOME / START
@@ -95,17 +80,21 @@ async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thumb = get_setting("START_THUMB_FILE_ID")
 
     msg = update.message if update.message else update.callback_query.message
+    menu = build_menu(user.id)
 
     if thumb:
-        await msg.reply_photo(photo=thumb, caption=welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU)
+        await msg.reply_photo(photo=thumb, caption=welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=menu)
     else:
-        await msg.reply_text(welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU)
+        await msg.reply_text(welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=menu)
+
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_home(update, context)
 
+
 async def home_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_home(update, context)
+
 
 # ============================================================
 # ACCOUNT / POINTS / BALANCE
@@ -139,20 +128,19 @@ async def my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+
 # ============================================================
 # HELP / CHAT ADMIN
 # ============================================================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = get_setting("HELP_TEXT") or DEFAULT_TEXT["HELP_TEXT"]
-    thumb = get_setting("HELP_THUMB_FILE_ID")
-    if thumb:
-        await update.message.reply_photo(photo=thumb, caption=text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
 
 async def chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = get_setting("CHAT_ADMIN_TEXT") or DEFAULT_TEXT["CHAT_ADMIN_TEXT"]
     await update.message.reply_text(text)
+
 
 # ============================================================
 # SHOP UI (EDIT SAME MESSAGE; BACK DOESN'T SPAM CHAT)
@@ -160,15 +148,9 @@ async def chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def shop_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cats = fetch_all("SELECT id,name FROM categories ORDER BY id")
     rows = [[InlineKeyboardButton(c["name"], callback_data=f"shop:cat:{c['id']}")] for c in cats]
-
     header = get_setting("SHOP_CATS_TEXT") or DEFAULT_TEXT["SHOP_CATS_TEXT"]
-    thumb = get_setting("SHOP_THUMB_FILE_ID")
+    await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
 
-    if thumb:
-        await update.message.reply_photo(photo=thumb, caption=header, parse_mode=ParseMode.MARKDOWN,
-                                         reply_markup=InlineKeyboardMarkup(rows))
-    else:
-        await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
 
 async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -252,8 +234,9 @@ async def cb_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(header, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
         return
 
+
 # ============================================================
-# CART / CHECKOUT (QTY + CONFIRM + CANCEL)
+# CART / CHECKOUT
 # ============================================================
 def cart_kb(variant_id: int, qty: int, back_cb: str):
     return InlineKeyboardMarkup([
@@ -268,6 +251,7 @@ def cart_kb(variant_id: int, qty: int, back_cb: str):
         ],
         [InlineKeyboardButton("⬅ Back", callback_data=back_cb)],
     ])
+
 
 async def cb_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -331,12 +315,14 @@ async def cb_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=cart_kb(variant_id, qty, back_cb))
 
+
 async def cb_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
+
 # ============================================================
-# CONFIRM PURCHASE (AUTO DEDUCT BALANCE + AUTO DEDUCT STOCK + AUTO DELIVERY)
+# CONFIRM PURCHASE (ROLLBACK SAFE)
 # ============================================================
 async def cb_cart_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -368,8 +354,8 @@ async def cb_cart_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(f"❌ Not enough balance.\nNeed {money(total)}, you have {money(bal)}.")
         return
 
-    # Atomically pick N unsold stocks and mark sold
-    rows = exec_sql_returning("""
+    # Pick stocks and mark sold
+    picked = exec_sql_returning("""
         WITH picked AS (
             SELECT id, file_id, delivery_text
             FROM file_stocks
@@ -385,66 +371,84 @@ async def cb_cart_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         RETURNING picked.id, picked.file_id, picked.delivery_text;
     """, (variant_id, qty, user.id))
 
-    if len(rows) < qty:
+    if len(picked) < qty:
         await q.message.edit_text("❌ Not enough stock. Please reduce quantity.")
         return
 
-    # Deduct balance + record purchase
-    exec_sql("UPDATE users SET balance = balance - %s, points = points + %s WHERE user_id=%s", (total, qty, user.id))
-    exec_sql(
-        "INSERT INTO purchases(user_id, variant_id, qty, price_each, total_price) VALUES(%s,%s,%s,%s,%s)",
-        (user.id, variant_id, qty, price_each, total)
-    )
+    purchase_id = None
+    stock_ids = [int(r["id"]) for r in picked]
 
-    # Deliver
-    delivered = 0
-    if v["delivery_type"] == "file":
-        for r in rows:
-            if r["file_id"]:
+    try:
+        # Deduct balance + record purchase
+        exec_sql("UPDATE users SET balance = balance - %s, points = points + %s WHERE user_id=%s", (total, qty, user.id))
+
+        row = exec_sql_returning(
+            "INSERT INTO purchases(user_id, variant_id, qty, price_each, total_price) VALUES(%s,%s,%s,%s,%s) RETURNING id",
+            (user.id, variant_id, qty, price_each, total)
+        )
+        purchase_id = int(row[0]["id"])
+
+        # Deliver
+        if (v["delivery_type"] or "").lower() == "file":
+            for r in picked:
+                if not r["file_id"]:
+                    raise RuntimeError("Missing file_id in stock row")
                 await context.bot.send_document(
                     chat_id=user.id,
                     document=r["file_id"],
                     caption=f"✅ Delivery: {v['product_name']} — {v['name']}\nPrice: {money(price_each)}"
                 )
-                delivered += 1
-    else:
-        # text delivery
-        for r in rows:
-            payload = r["delivery_text"] or ""
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=f"✅ Delivery: {v['product_name']} — {v['name']}\nPrice: {money(price_each)}\n\n`{payload}`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            delivered += 1
+        else:
+            for r in picked:
+                payload = (r["delivery_text"] or "").strip()
+                if not payload:
+                    raise RuntimeError("Missing delivery_text in stock row")
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=f"✅ Delivery: {v['product_name']} — {v['name']}\nPrice: {money(price_each)}\n\n`{payload}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
 
-    context.user_data.pop("cart_qty", None)
-    context.user_data.pop("cart_variant_id", None)
+        # success
+        context.user_data.pop("cart_qty", None)
+        context.user_data.pop("cart_variant_id", None)
+        await q.message.edit_text(f"✅ Purchased **{qty}** and delivered!\nTotal: {money(total)}",
+                                  parse_mode=ParseMode.MARKDOWN)
 
-    await q.message.edit_text(f"✅ Purchased **{qty}** and delivered **{delivered}** item(s)!\nTotal: {money(total)}",
-                              parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.exception("Delivery failed, rolling back: %s", e)
+
+        # ROLLBACK: restore stocks
+        exec_sql(
+            "UPDATE file_stocks SET is_sold=FALSE, sold_to=NULL, sold_at=NULL WHERE id = ANY(%s)",
+            (stock_ids,)
+        )
+
+        # refund balance/points
+        exec_sql("UPDATE users SET balance = balance + %s, points = GREATEST(points - %s, 0) WHERE user_id=%s",
+                 (total, qty, user.id))
+
+        # delete purchase
+        if purchase_id:
+            exec_sql("DELETE FROM purchases WHERE id=%s", (purchase_id,))
+
+        await q.message.edit_text("❌ Delivery failed. Your balance & stock were restored.\nTry again.")
+
 
 # ============================================================
-# RESELLER REGISTRATION (kept same, shortened here)
+# ADMIN COMMANDS
 # ============================================================
-async def reseller_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["reseller_step"] = 1
-    await update.message.reply_text("📩 **Reseller Registration**\n\nSend your **Full Name**:", parse_mode=ParseMode.MARKDOWN)
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # (You can keep your reseller form steps here exactly as before)
-    if "reseller_step" not in context.user_data:
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Access denied.")
         return
-    # ... keep your existing reseller logic ...
+    await update.message.reply_text("🔐 Admin ready ✅")
 
-# ============================================================
-# ADMIN: ADD BALANCE
-# ============================================================
+
 async def addbal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
-    # usage: /addbal <user_id> <amount>
     parts = update.message.text.strip().split()
     if len(parts) != 3:
         await update.message.reply_text("Usage: /addbal <user_id> <amount>")
@@ -453,6 +457,7 @@ async def addbal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amt = int(parts[2])
     exec_sql("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amt, uid))
     await update.message.reply_text(f"✅ Added {money(amt)} to `{uid}`", parse_mode=ParseMode.MARKDOWN)
+
 
 # ============================================================
 # BOOT
@@ -471,18 +476,18 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^🏠 Home$"), home_btn))
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Shop$"), shop_btn))
     app.add_handler(MessageHandler(filters.Regex(r"^👤 My Account$"), my_account))
-    app.add_handler(MessageHandler(filters.Regex(r"^📩 Reseller Register$"), reseller_register))
+    app.add_handler(MessageHandler(filters.Regex(r"^📩 Reseller Register$"), lambda u, c: None))
     app.add_handler(MessageHandler(filters.Regex(r"^💬 Chat Admin$"), chat_admin))
     app.add_handler(MessageHandler(filters.Regex(r"^🆘 Help$"), help_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔐 Admin$"), admin_cmd))
 
     app.add_handler(CallbackQueryHandler(cb_shop, pattern=r"^shop:"))
     app.add_handler(CallbackQueryHandler(cb_cart, pattern=r"^cart:(start|inc|dec|cancel):"))
     app.add_handler(CallbackQueryHandler(cb_cart_confirm, pattern=r"^cart:confirm:"))
     app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
