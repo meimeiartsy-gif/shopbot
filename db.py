@@ -10,13 +10,8 @@ def connect():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def ensure_schema():
-    """
-    Creates tables if missing + MIGRATES old tables by adding missing columns.
-    This fixes your 'column does not exist' errors.
-    """
     with connect() as conn:
         with conn.cursor() as cur:
-            # --- base tables (create) ---
             cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -51,15 +46,15 @@ def ensure_schema():
                 name TEXT NOT NULL,
                 price INTEGER NOT NULL DEFAULT 0,
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                delivery_type TEXT NOT NULL DEFAULT 'text',  -- 'text' or 'file'
-                bundle_qty INTEGER NOT NULL DEFAULT 1        -- 1pc / 5pcs / 10pcs etc
+                delivery_type TEXT NOT NULL DEFAULT 'text',
+                bundle_qty INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS file_stocks (
                 id SERIAL PRIMARY KEY,
                 variant_id INTEGER REFERENCES variants(id) ON DELETE CASCADE,
-                file_id TEXT,               -- can be NULL now
-                delivery_text TEXT,          -- can be NULL
+                file_id TEXT,
+                delivery_text TEXT,
                 is_sold BOOLEAN NOT NULL DEFAULT FALSE,
                 sold_to BIGINT,
                 sold_at TIMESTAMP
@@ -69,7 +64,7 @@ def ensure_schema():
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
                 variant_id INTEGER REFERENCES variants(id) ON DELETE SET NULL,
-                quantity INTEGER NOT NULL DEFAULT 1,     -- how many "units" bought
+                quantity INTEGER NOT NULL DEFAULT 1,
                 unit_price INTEGER NOT NULL DEFAULT 0,
                 total_price INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -93,14 +88,14 @@ def ensure_schema():
                 user_id BIGINT NOT NULL,
                 amount INTEGER NOT NULL,
                 proof_file_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/REJECTED
+                status TEXT NOT NULL DEFAULT 'PENDING',
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 decided_at TIMESTAMP,
                 admin_id BIGINT
             );
             """)
 
-            # --- MIGRATIONS (for your old tables) ---
+            # migrations
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER NOT NULL DEFAULT 0;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS points INTEGER NOT NULL DEFAULT 0;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP NOT NULL DEFAULT NOW();")
@@ -117,7 +112,6 @@ def ensure_schema():
 
             cur.execute("ALTER TABLE file_stocks ADD COLUMN IF NOT EXISTS delivery_text TEXT;")
             cur.execute("ALTER TABLE file_stocks ADD COLUMN IF NOT EXISTS file_id TEXT;")
-            # make file_id nullable if old schema forced NOT NULL
             try:
                 cur.execute("ALTER TABLE file_stocks ALTER COLUMN file_id DROP NOT NULL;")
             except Exception:
@@ -139,10 +133,7 @@ def ensure_user(user_id: int, username: str | None):
             if row:
                 cur.execute("UPDATE users SET username=%s WHERE user_id=%s", (username, user_id))
             else:
-                cur.execute(
-                    "INSERT INTO users(user_id, username) VALUES(%s,%s)",
-                    (user_id, username)
-                )
+                cur.execute("INSERT INTO users(user_id, username) VALUES(%s,%s)", (user_id, username))
         conn.commit()
 
 def fetch_one(sql: str, params=None):
@@ -176,16 +167,15 @@ def get_setting(key: str) -> str | None:
     row = fetch_one("SELECT value FROM settings WHERE key=%s", (key,))
     return row["value"] if row else None
 
-# --------- SAFE PURCHASE TRANSACTION (NO GHOST DEDUCT) ----------
 def purchase_variant(user_id: int, variant_id: int, qty_units: int):
     """
-    qty_units = how many "units" of this variant user buys.
+    qty_units = how many units user buys.
     Need = qty_units * bundle_qty stock rows.
     Deducts balance + marks stocks sold ONLY inside transaction.
+    Points: 1 point per purchase order (not per qty).
     """
     with connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # lock user row
             cur.execute("SELECT user_id, balance FROM users WHERE user_id=%s FOR UPDATE", (user_id,))
             u = cur.fetchone()
             if not u:
@@ -208,9 +198,8 @@ def purchase_variant(user_id: int, variant_id: int, qty_units: int):
             total = unit_price * qty_units
 
             if u["balance"] < total:
-                return {"ok": False, "error": f"NOT_ENOUGH_BALANCE", "need": total, "have": u["balance"]}
+                return {"ok": False, "error": "NOT_ENOUGH_BALANCE", "need": total, "have": u["balance"]}
 
-            # lock needed stocks
             cur.execute("""
                 SELECT id, file_id, delivery_text
                 FROM file_stocks
@@ -226,25 +215,23 @@ def purchase_variant(user_id: int, variant_id: int, qty_units: int):
 
             stock_ids = [s["id"] for s in stocks]
 
-            # deduct balance
             cur.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (total, user_id))
 
-            # mark sold
             cur.execute("""
                 UPDATE file_stocks
                 SET is_sold=TRUE, sold_to=%s, sold_at=NOW()
                 WHERE id = ANY(%s)
             """, (user_id, stock_ids))
 
-            # save purchase
             cur.execute("""
                 INSERT INTO purchases(user_id, variant_id, quantity, unit_price, total_price)
                 VALUES(%s,%s,%s,%s,%s)
             """, (user_id, variant_id, qty_units, unit_price, total))
 
-            # points: 1 point per "unit" purchased
-            cur.execute("UPDATE users SET points=points+%s WHERE user_id=%s", (qty_units, user_id))
+            # 1 order = 1 point
+            cur.execute("UPDATE users SET points=points+1 WHERE user_id=%s", (user_id,))
 
         conn.commit()
 
     return {"ok": True, "variant": v, "stocks": stocks, "qty_units": qty_units, "total": total}
+
