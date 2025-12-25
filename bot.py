@@ -5,7 +5,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
-    MenuButtonCommands
+    MenuButtonDefault
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -21,7 +21,6 @@ from db import (
     fetch_one,
     execute,
     get_setting,
-    set_setting
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -54,36 +53,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username)
 
-    # 🔥 FORCE REMOVE ANY KEYBOARD
+    # 🔥 HARD FORCE REMOVE ALL OLD REPLY KEYBOARDS (2-step)
     await update.message.reply_text(
-        " ",
-        reply_markup=ReplyKeyboardRemove()
+        "Removing old buttons…",
+        reply_markup=ReplyKeyboardRemove(selective=False)
     )
+    await update.message.reply_text(" ")
 
-    # 🔥 FORCE REMOVE MENU BUTTON
+    # 🔥 HARD REMOVE MENU BUTTON (Mini App / Menu)
     await context.bot.set_chat_menu_button(
         chat_id=user.id,
-        menu_button=MenuButtonCommands()
+        menu_button=MenuButtonDefault()
     )
 
+    # ─── ADMIN ───
     if is_admin(user.id):
         await update.message.reply_text(
             "🔐 **Admin Panel**",
             reply_markup=admin_menu(),
             parse_mode="Markdown"
         )
-    else:
-        text = get_setting("TEXT_HOME") or "Welcome to Luna’s Prem Shop 💖"
-        thumb = get_setting("THUMB_HOME")
+        return
 
-        if thumb:
-            await update.message.reply_photo(
-                photo=thumb,
-                caption=text,
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(text)
+    # ─── CUSTOMER ───
+    text = get_setting("TEXT_HOME") or "Welcome to Luna’s Prem Shop 💖"
+    thumb = get_setting("THUMB_HOME")
+
+    if thumb:
+        await update.message.reply_photo(
+            photo=thumb,
+            caption=text,
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(text)
 
 # ─────────────────────────────
 # CALLBACKS
@@ -97,7 +100,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(uid):
         return
 
-    # ─── ADMIN ───
+    # ─── ADMIN TOPUPS ───
     if q.data == "admin_topups":
         rows = fetch_all("""
             SELECT id, user_id, amount
@@ -146,7 +149,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Top-up rejected.")
 
     elif q.data == "admin_purchases":
-        rows = fetch_all("SELECT user_id, total_price, created_at FROM purchases ORDER BY id DESC LIMIT 10")
+        rows = fetch_all("""
+            SELECT user_id, total_price, created_at
+            FROM purchases
+            ORDER BY id DESC
+            LIMIT 10
+        """)
         msg = "🧾 Purchases\n\n"
         for r in rows:
             msg += f"{r['user_id']} — ₱{r['total_price']} — {r['created_at']}\n"
