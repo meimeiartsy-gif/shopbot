@@ -12,6 +12,8 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from db import (
@@ -45,25 +47,43 @@ def admin_menu():
 
 
 async def hard_remove_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    # 1) Remove reply keyboard (MUST have real text)
+    """
+    HARD remove any old reply keyboard + reset menu button.
+    (Telegram sometimes requires multiple removes.)
+    """
+    # 1) Remove reply keyboard (must have visible text)
     await context.bot.send_message(
         chat_id=chat_id,
         text="✅ Buttons cleared.",
         reply_markup=ReplyKeyboardRemove(selective=False),
     )
 
-    # 2) Send a zero-width char message with remove again (Telegram sometimes needs 2nd)
+    # 2) Send another remove (Telegram sometimes needs a 2nd one)
     await context.bot.send_message(
         chat_id=chat_id,
-        text="\u200b",
+        text="(clearing...)",
         reply_markup=ReplyKeyboardRemove(selective=False),
     )
 
-    # 3) Reset menu button (removes Mini App / Menu button)
+    # 3) Reset menu button to default
     await context.bot.set_chat_menu_button(
         chat_id=chat_id,
         menu_button=MenuButtonDefault(),
     )
+
+
+async def send_customer_home(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    text = get_setting("TEXT_HOME") or "Welcome to Luna’s Prem Shop 💖"
+    thumb = get_setting("THUMB_HOME")
+
+    if thumb:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=thumb,
+            caption=text,
+        )
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 # ─────────────────────────────
@@ -78,32 +98,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await hard_remove_keyboard(context, user.id)
 
     if is_admin(user.id):
-        # Clean admin panel (NO old "commands list" text)
         await context.bot.send_message(
             chat_id=user.id,
             text="🔐 Admin Panel",
             reply_markup=admin_menu(),
         )
-        return
-
-    # Customer home (text + optional thumbnail)
-    text = get_setting("TEXT_HOME") or "Welcome to Luna’s Prem Shop 💖"
-    thumb = get_setting("THUMB_HOME")
-
-    if thumb:
-        await context.bot.send_photo(
-            chat_id=user.id,
-            photo=thumb,
-            caption=text,
-        )
     else:
-        await context.bot.send_message(chat_id=user.id, text=text)
+        await send_customer_home(context, user.id)
 
 
-# Optional: if you want a manual command to force-clear buttons anytime:
 async def clearkb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await hard_remove_keyboard(context, update.effective_chat.id)
-    await update.message.reply_text("✅ Cleared.")
+    await update.message.reply_text("✅ Cleared.", reply_markup=ReplyKeyboardRemove())
+
+
+# ─────────────────────────────
+# THIS IS THE IMPORTANT PART:
+# If the old buttons are still showing,
+# when user presses them Telegram sends TEXT.
+# We catch ANY text and clear keyboard again.
+# ─────────────────────────────
+
+async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username)
+
+    # Always try to clear old reply keyboard on ANY text
+    await hard_remove_keyboard(context, user.id)
+
+    # Admin: let them type "Admin" to open panel quickly if they want
+    if is_admin(user.id):
+        if (update.message.text or "").strip().lower() == "admin":
+            await update.message.reply_text(
+                "🔐 Admin Panel",
+                reply_markup=admin_menu(),
+            )
+        else:
+            # do nothing / or show admin panel always:
+            await update.message.reply_text(
+                "🔐 Admin Panel",
+                reply_markup=admin_menu(),
+            )
+        return
+
+    # Customer: always show home after clearing keyboard
+    await send_customer_home(context, user.id)
 
 
 # ─────────────────────────────
@@ -212,6 +251,10 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clearkb", clearkb))
+
+    # IMPORTANT: catch ANY text (old keyboard presses are text)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
+
     app.add_handler(CallbackQueryHandler(callbacks))
 
     app.run_polling(drop_pending_updates=True)
