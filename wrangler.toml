@@ -1,7 +1,8 @@
-name = "shopbot"
-main = "src/worker.js"
+name = "shopnluna-api"
+main = "worker/worker.js"
 compatibility_date = "2025-01-01"
 
-[assets]
-directory = "./public"
-binding = "ASSETS"
+[[d1_databases]]
+binding = "DB"
+database_name = "shopnluna_db"
+database_id = "13a5618a-e6d6-4c76-a6a2-19d937c04de1"
